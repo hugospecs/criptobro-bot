@@ -410,7 +410,7 @@ def main():
     app.add_handler(CommandHandler("estado",   cmd_estado))
     app.add_handler(CommandHandler("analizar", cmd_analizar))
     app.add_handler(CommandHandler("precio",   cmd_precio))
-    app.add_handler(CommandHandler("añadir",   cmd_añadir))
+    app.add_handler(CommandHandler("anadir",   cmd_añadir))
     app.add_handler(CommandHandler("quitar",   cmd_quitar))
     app.add_handler(CommandHandler("ayuda",    cmd_ayuda))
 
