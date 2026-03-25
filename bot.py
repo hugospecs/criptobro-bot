@@ -28,32 +28,144 @@ PORTFOLIO_FILE  = "portfolio.json"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
-# ── Catálogo de monedas ───────────────────────────────────────────────────────
-SYMBOLS = {
-    "bitcoin": "BTC", "ethereum": "ETH", "solana": "SOL",
-    "ripple": "XRP", "cardano": "ADA", "dogecoin": "DOGE",
-    "avalanche-2": "AVAX", "chainlink": "LINK", "polkadot": "DOT",
-    "the-open-network": "TON", "binancecoin": "BNB", "litecoin": "LTC",
-    "stellar": "XLM", "monero": "XMR", "algorand": "ALGO",
-    "cosmos": "ATOM", "near": "NEAR", "aptos": "APT",
-    "arbitrum": "ARB", "optimism": "OP", "sui": "SUI",
-    "injective-protocol": "INJ", "render-token": "RENDER",
-    "fetch-ai": "FET", "worldcoin-wld": "WLD",
-}
+# ── Catálogo dinámico de monedas ──────────────────────────────────────────────
+# Se carga desde CoinGecko al arrancar y se refresca cada 24h.
+# Cubre TODAS las criptos listadas (~13.000+).
 
-ALL_COIN_IDS = list(SYMBOLS.keys())
-ID_BY_SYMBOL = {v.lower(): k for k, v in SYMBOLS.items()}
+COIN_CATALOGUE = {}   # { coin_id: {"symbol": "BTC", "name": "Bitcoin"} }
+_catalogue_ts  = 0    # timestamp de la última carga
+
+SCANNER_TOP_IDS = []  # top 250 por market cap para el scanner
+
+def _load_catalogue():
+    """Descarga la lista completa de monedas de CoinGecko."""
+    global _catalogue_ts
+    try:
+        r = requests.get(
+            "https://api.coingecko.com/api/v3/coins/list",
+            params={"include_platform": "false"},
+            timeout=30,
+        )
+        r.raise_for_status()
+        coins = r.json()
+        COIN_CATALOGUE.clear()
+        for c in coins:
+            cid = c["id"]
+            COIN_CATALOGUE[cid] = {
+                "symbol": c["symbol"].upper(),
+                "name":   c["name"],
+            }
+        _catalogue_ts = datetime.now().timestamp()
+        log.info("Catálogo cargado: %d monedas", len(COIN_CATALOGUE))
+    except Exception as e:
+        log.error("Error cargando catálogo: %s", e)
+
+def _load_scanner_top():
+    """Descarga el top 250 por market cap para el scanner."""
+    global SCANNER_TOP_IDS
+    try:
+        ids = []
+        for page in range(1, 4):   # 3 páginas × 100 = top 300
+            r = requests.get(
+                "https://api.coingecko.com/api/v3/coins/markets",
+                params={
+                    "vs_currency": "usd",
+                    "order": "market_cap_desc",
+                    "per_page": 100,
+                    "page": page,
+                    "sparkline": "false",
+                },
+                timeout=20,
+            )
+            r.raise_for_status()
+            ids.extend(c["id"] for c in r.json())
+            import time; time.sleep(0.5)
+        SCANNER_TOP_IDS = ids
+        log.info("Scanner top cargado: %d monedas", len(SCANNER_TOP_IDS))
+    except Exception as e:
+        log.error("Error cargando scanner top: %s", e)
+
+def ensure_catalogue():
+    """Recarga el catálogo si tiene más de 24 horas."""
+    if not COIN_CATALOGUE or (datetime.now().timestamp() - _catalogue_ts) > 86400:
+        _load_catalogue()
+    if not SCANNER_TOP_IDS:
+        _load_scanner_top()
 
 def sym(coin_id):
-    return SYMBOLS.get(coin_id, coin_id.upper())
+    """Devuelve el símbolo (BTC, ETH…) de un coin_id."""
+    entry = COIN_CATALOGUE.get(coin_id)
+    if entry:
+        return entry["symbol"]
+    return coin_id.upper()
 
 def resolve_coin(user_input):
+    """
+    Convierte lo que escribe el usuario en un coin_id de CoinGecko.
+    Acepta: símbolo (BTC), nombre (bitcoin), ID (bitcoin), parcial (bit).
+    Si hay ambigüedad devuelve el de mayor market cap (posición en SCANNER_TOP_IDS).
+    """
+    ensure_catalogue()
     u = user_input.strip().lower()
-    if u in SYMBOLS:        return u
-    if u in ID_BY_SYMBOL:   return ID_BY_SYMBOL[u]
-    for cid in SYMBOLS:
-        if u in cid or u in SYMBOLS[cid].lower():
-            return cid
+
+    # 1. Coincidencia exacta por ID
+    if u in COIN_CATALOGUE:
+        return u
+
+    # 2. Coincidencia exacta por símbolo
+    exact_sym = [
+        cid for cid, data in COIN_CATALOGUE.items()
+        if data["symbol"].lower() == u
+    ]
+    if exact_sym:
+        # Si hay varios con el mismo símbolo, preferir el de mayor market cap
+        if SCANNER_TOP_IDS:
+            for top_id in SCANNER_TOP_IDS:
+                if top_id in exact_sym:
+                    return top_id
+        return exact_sym[0]
+
+    # 3. Coincidencia exacta por nombre
+    exact_name = [
+        cid for cid, data in COIN_CATALOGUE.items()
+        if data["name"].lower() == u
+    ]
+    if exact_name:
+        return exact_name[0]
+
+    # 4. Búsqueda parcial (símbolo o nombre contiene el texto)
+    partial = [
+        cid for cid, data in COIN_CATALOGUE.items()
+        if u in data["symbol"].lower() or u in data["name"].lower()
+    ]
+    if partial:
+        if SCANNER_TOP_IDS:
+            for top_id in SCANNER_TOP_IDS:
+                if top_id in partial:
+                    return top_id
+        return partial[0]
+
+    # 5. Búsqueda en CoinGecko search API como último recurso
+    try:
+        r = requests.get(
+            "https://api.coingecko.com/api/v3/search",
+            params={"query": user_input},
+            timeout=10,
+        )
+        r.raise_for_status()
+        results = r.json().get("coins", [])
+        if results:
+            found_id = results[0]["id"]
+            # Añadir al catálogo local si no estaba
+            if found_id not in COIN_CATALOGUE:
+                COIN_CATALOGUE[found_id] = {
+                    "symbol": results[0]["symbol"].upper(),
+                    "name":   results[0]["name"],
+                }
+            return found_id
+    except Exception:
+        pass
+
     return None
 
 # ── Estado global ─────────────────────────────────────────────────────────────
@@ -64,6 +176,11 @@ state = {
 }
 
 def load_state():
+    # Cargar catálogo completo al arrancar
+    log.info("Cargando catálogo de monedas desde CoinGecko...")
+    _load_catalogue()
+    _load_scanner_top()
+
     if os.path.exists(PORTFOLIO_FILE):
         try:
             with open(PORTFOLIO_FILE) as f:
@@ -388,15 +505,18 @@ HELP_TEXT = (
     "📊 *ANÁLISIS*\n"
     "  /analizar — Analizar toda tu cartera\n"
     "  /analizar BTC — Analizar una cripto concreta\n\n"
-    "🔍 *SCANNER*\n"
-    "  /scanner — Escanear el mercado completo\n"
+    "🔍 *BÚSQUEDA Y SCANNER*\n"
+    "  /buscar PEPE — Buscar cualquier cripto \\(13\\.000\\+\\)\n"
+    "  /buscar hedera — Por nombre o símbolo\n"
+    "  /scanner — Escanear top 100 por market cap\n"
     "  /top — Top 5 oportunidades rápidas\n\n"
     "💬 *CHAT IA*\n"
     "  /chat ¿Debo vender mi ETH? — Chat con IA\n"
     "  Escribe cualquier mensaje sin / para chatear\n"
     "  /resetChat — Borrar historial de chat\n\n"
     "━━━━━━━━━━━━━━━━━━━━━━\n"
-    "_Alertas automáticas cada 5 min\\._"
+    "_Alertas automáticas cada 5 min\\._\n"
+    "_Catálogo: 13\\.000\\+ criptomonedas\\._"
 )
 
 async def cmd_start(update, ctx):
@@ -653,27 +773,38 @@ async def cmd_analizar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ── Scanner ───────────────────────────────────────────────────────────────────
 async def cmd_scanner(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ensure_catalogue()
+    scan_ids = SCANNER_TOP_IDS[:100] if SCANNER_TOP_IDS else []
+    if not scan_ids:
+        await update.message.reply_text("❌ No se pudo cargar la lista de monedas. Intenta de nuevo.")
+        return
+
     msg = await update.message.reply_text(
-        f"🔍 Escaneando {len(ALL_COIN_IDS)} criptomonedas...\n_Puede tardar hasta 30 seg._",
+        f"🔍 Escaneando top {len(scan_ids)} criptomonedas por capitalización...\n_Puede tardar hasta 40 seg._",
         parse_mode="Markdown",
     )
 
-    data  = get_prices(ALL_COIN_IDS)
-    opps  = []
+    # Obtener precios en lotes de 50 (límite CoinGecko)
+    data = {}
+    for i in range(0, len(scan_ids), 50):
+        batch = scan_ids[i:i+50]
+        data.update(get_prices(batch))
+        await asyncio.sleep(1.2)
 
-    for cid in ALL_COIN_IDS:
+    opps = []
+    for cid in scan_ids:
         info = data.get(cid)
         if not info:
             continue
         a = full_analysis(cid, info, days=14)
         opps.append((cid, a))
-        await asyncio.sleep(0.15)
+        await asyncio.sleep(0.1)
 
     opps.sort(key=lambda x: x[1]["score"], reverse=True)
     buy_ops  = [(c, a) for c, a in opps if a["score"] >= 2]
     sell_ops = [(c, a) for c, a in opps if a["score"] <= -3]
 
-    lines = [f"🔍 *Scanner de Mercado — {datetime.now().strftime('%H:%M')}*\n"]
+    lines = [f"🔍 *Scanner — {datetime.now().strftime('%H:%M')}* (top {len(scan_ids)} por mkt cap)\n"]
 
     if buy_ops:
         lines.append("🟢 *OPORTUNIDADES DE COMPRA*")
@@ -716,16 +847,18 @@ async def cmd_scanner(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_top(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ensure_catalogue()
+    top_ids = SCANNER_TOP_IDS[:20] if SCANNER_TOP_IDS else []
     msg  = await update.message.reply_text("⚡ Buscando top oportunidades...")
-    data = get_prices(ALL_COIN_IDS[:14])
+    data = get_prices(top_ids)
     scored = []
-    for cid in ALL_COIN_IDS[:14]:
+    for cid in top_ids:
         info = data.get(cid)
         if not info:
             continue
         a = full_analysis(cid, info, days=14)
         scored.append((cid, a))
-        await asyncio.sleep(0.12)
+        await asyncio.sleep(0.1)
 
     scored.sort(key=lambda x: x[1]["score"], reverse=True)
     lines = [f"⚡ *Top 5 Oportunidades — {datetime.now().strftime('%H:%M')}*\n"]
@@ -737,6 +870,62 @@ async def cmd_top(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"  24h: {pct(a['chg24'])}\n"
         )
     await msg.edit_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def cmd_buscar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    /buscar PEPE  — busca la cripto y muestra info + botón de análisis.
+    Sirve para encontrar cualquier moneda aunque no esté en el top.
+    """
+    if not ctx.args:
+        await update.message.reply_text(
+            "Uso: `/buscar PEPE` o `/buscar hedera`\n"
+            "Busca cualquier criptomoneda por símbolo o nombre.",
+            parse_mode="Markdown",
+        )
+        return
+
+    query   = " ".join(ctx.args)
+    msg     = await update.message.reply_text(f"🔍 Buscando '{query}'...")
+    ensure_catalogue()
+    coin_id = resolve_coin(query)
+
+    if not coin_id:
+        await msg.edit_text(
+            f"❌ No encontré ninguna cripto con '{query}'.\n"
+            "Prueba con el nombre completo en inglés (ej: pepe, hedera, vechain)."
+        )
+        return
+
+    info = get_prices([coin_id])
+    if not info or coin_id not in info:
+        # Puede ser una moneda con volumen muy bajo — mostrar nombre igualmente
+        entry = COIN_CATALOGUE.get(coin_id, {})
+        await msg.edit_text(
+            f"✅ Encontrada: *{entry.get('name', coin_id)}* ({sym(coin_id)})\n\n"
+            f"ID CoinGecko: `{coin_id}`\n\n"
+            f"⚠️ No hay datos de precio disponibles ahora mismo (posible moneda sin liquidez).",
+            parse_mode="Markdown",
+        )
+        return
+
+    entry = COIN_CATALOGUE.get(coin_id, {})
+    d     = info[coin_id]
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton(f"📊 Analizar {sym(coin_id)}", callback_data=f"analyse:{coin_id}"),
+        InlineKeyboardButton(f"📥 Registrar compra",       callback_data=f"buy_prompt:{coin_id}"),
+    ]])
+    await msg.edit_text(
+        f"✅ *{entry.get('name', coin_id)}* ({sym(coin_id)})\n\n"
+        f"  💰 Precio: *{fp(d['usd'])}*\n"
+        f"  24h: {pct(d.get('usd_24h_change', 0) or 0)}\n"
+        f"  7d:  {pct(d.get('usd_7d_change',  0) or 0)}\n"
+        f"  Vol 24h: ${(d.get('usd_24h_vol', 0) or 0)/1e9:.3f}B\n"
+        f"  Mkt cap: ${(d.get('usd_market_cap', 0) or 0)/1e9:.3f}B\n\n"
+        f"_ID: `{coin_id}`_",
+        parse_mode="Markdown",
+        reply_markup=keyboard,
+    )
 
 # ── Chat IA ───────────────────────────────────────────────────────────────────
 async def cmd_chat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -769,12 +958,27 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if query.data.startswith("buy_prompt:"):
-        cid = query.data.split(":")[1]
+    data  = query.data
+
+    if data.startswith("buy_prompt:"):
+        cid = data.split(":")[1]
         await query.message.reply_text(
             f"Para registrar la compra de *{sym(cid)}* usa:\n\n"
             f"`/compra {sym(cid)} <cantidad>`\n\n"
-            f"Ejemplo: `/compra {sym(cid)} 10`",
+            f"Ejemplo: `/compra {sym(cid)} 100`",
+            parse_mode="Markdown",
+        )
+
+    elif data.startswith("analyse:"):
+        cid  = data.split(":")[1]
+        msg  = await query.message.reply_text(f"🔍 Analizando {sym(cid)}...")
+        info = get_prices([cid])
+        if not info or cid not in info:
+            await msg.edit_text("❌ No pude obtener datos de precio.")
+            return
+        a = full_analysis(cid, info[cid])
+        await msg.edit_text(
+            build_analysis_msg(cid, a, show_portfolio=(cid in state["portfolio"])),
             parse_mode="Markdown",
         )
 
@@ -849,6 +1053,7 @@ def main():
     app.add_handler(CommandHandler("venta",     cmd_venta))
     app.add_handler(CommandHandler("precio",    cmd_precio))
     app.add_handler(CommandHandler("analizar",  cmd_analizar))
+    app.add_handler(CommandHandler("buscar",    cmd_buscar))
     app.add_handler(CommandHandler("scanner",   cmd_scanner))
     app.add_handler(CommandHandler("top",       cmd_top))
     app.add_handler(CommandHandler("chat",      cmd_chat))
