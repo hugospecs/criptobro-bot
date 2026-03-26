@@ -21,7 +21,7 @@ from telegram.ext import (
 TELEGRAM_TOKEN  = os.environ.get("TELEGRAM_TOKEN", "")
 CHAT_ID         = os.environ.get("CHAT_ID", "")
 ANTHROPIC_KEY   = os.environ.get("ANTHROPIC_KEY", "")
-CHECK_INTERVAL  = 300      # 5 minutos
+CHECK_INTERVAL  = 420      # 7 minutos — evita saturar el rate limit de CoinGecko
 ALERT_COOLDOWN  = 7200     # 2 horas entre alertas iguales
 PORTFOLIO_FILE  = "portfolio.json"
 
@@ -199,43 +199,122 @@ def save_state():
     except Exception as e:
         log.error("Error guardando estado: %s", e)
 
-# ── CoinGecko API ─────────────────────────────────────────────────────────────
-GECKO = "https://api.coingecko.com/api/v3"
+# ── CoinGecko API con reintentos, caché y control de rate limit ───────────────
+GECKO        = "https://api.coingecko.com/api/v3"
+_price_cache = {}   # { frozenset(ids): (timestamp, data) }
+_hist_cache  = {}   # { (coin_id, days): (timestamp, data) }
+CACHE_TTL    = 60   # segundos que un precio es válido antes de volver a pedir
+
+import time as _time
+
+def _gecko_get(url, params, retries=4, base_wait=8):
+    """
+    Hace una petición a CoinGecko con:
+    - Reintentos automáticos (hasta 4 veces)
+    - Espera exponencial si recibe 429 (Too Many Requests)
+    - Timeout generoso
+    """
+    for attempt in range(retries):
+        try:
+            r = requests.get(url, params=params, timeout=25)
+
+            if r.status_code == 429:
+                # Rate limit: esperar y reintentar
+                wait = base_wait * (2 ** attempt)
+                log.warning("Rate limit CoinGecko — esperando %ds (intento %d/%d)", wait, attempt+1, retries)
+                _time.sleep(wait)
+                continue
+
+            if r.status_code == 503 or r.status_code == 502:
+                # Servidor caído temporalmente
+                wait = base_wait * (attempt + 1)
+                log.warning("CoinGecko %d — esperando %ds", r.status_code, wait)
+                _time.sleep(wait)
+                continue
+
+            r.raise_for_status()
+            return r.json()
+
+        except requests.exceptions.ConnectionError:
+            log.warning("Sin conexión — intento %d/%d", attempt+1, retries)
+            _time.sleep(base_wait)
+        except requests.exceptions.Timeout:
+            log.warning("Timeout — intento %d/%d", attempt+1, retries)
+            _time.sleep(4)
+        except Exception as e:
+            log.error("_gecko_get error inesperado: %s", e)
+            _time.sleep(4)
+
+    log.error("_gecko_get: agotados %d reintentos para %s", retries, url)
+    return None
+
 
 def get_prices(coin_ids):
     if not coin_ids:
         return {}
-    try:
-        r = requests.get(
+
+    coin_ids = list(dict.fromkeys(coin_ids))  # deduplicar
+    key      = frozenset(coin_ids)
+    now      = _time.time()
+
+    # Devolver caché si es reciente
+    if key in _price_cache:
+        ts, cached = _price_cache[key]
+        if now - ts < CACHE_TTL:
+            return cached
+
+    # Dividir en lotes de 50 si hay muchas monedas
+    result = {}
+    for i in range(0, len(coin_ids), 50):
+        batch = coin_ids[i:i+50]
+        data  = _gecko_get(
             f"{GECKO}/simple/price",
             params={
-                "ids": ",".join(coin_ids),
-                "vs_currencies": "usd",
-                "include_24hr_change": "true",
-                "include_7d_change": "true",
-                "include_24hr_vol": "true",
-                "include_market_cap": "true",
+                "ids":                  ",".join(batch),
+                "vs_currencies":        "usd",
+                "include_24hr_change":  "true",
+                "include_7d_change":    "true",
+                "include_24hr_vol":     "true",
+                "include_market_cap":   "true",
             },
-            timeout=20,
         )
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        log.error("get_prices: %s", e)
-        return {}
+        if data:
+            result.update(data)
+        if i + 50 < len(coin_ids):
+            _time.sleep(1.5)  # pausa entre lotes para no saturar
+
+    if result:
+        _price_cache[key] = (_time.time(), result)
+
+    return result
+
 
 def get_history(coin_id, days=30):
-    try:
-        r = requests.get(
-            f"{GECKO}/coins/{coin_id}/market_chart",
-            params={"vs_currency": "usd", "days": days, "interval": "daily"},
-            timeout=20,
-        )
-        r.raise_for_status()
-        return [p[1] for p in r.json().get("prices", [])]
-    except Exception as e:
-        log.error("get_history %s: %s", coin_id, e)
-        return []
+    key = (coin_id, days)
+    now = _time.time()
+
+    # Caché de historial: válido 10 minutos
+    if key in _hist_cache:
+        ts, cached = _hist_cache[key]
+        if now - ts < 600:
+            return cached
+
+    data = _gecko_get(
+        f"{GECKO}/coins/{coin_id}/market_chart",
+        params={"vs_currency": "usd", "days": days, "interval": "daily"},
+    )
+
+    if data:
+        prices = [p[1] for p in data.get("prices", [])]
+        _hist_cache[key] = (_time.time(), prices)
+        return prices
+
+    # Si falla, devolver caché antigua si existe (mejor que nada)
+    if key in _hist_cache:
+        log.warning("Usando historial en caché antiguo para %s", coin_id)
+        return _hist_cache[key][1]
+
+    return []
 
 # ── Indicadores técnicos ──────────────────────────────────────────────────────
 def calc_rsi(prices, period=14):
@@ -612,7 +691,13 @@ async def cmd_compra(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     else:
         info = get_prices([coin_id])
         if not info or coin_id not in info:
-            await update.message.reply_text("❌ No pude obtener el precio. Inténtalo de nuevo.")
+            await update.message.reply_text(
+                f"⚠️ No pude obtener el precio actual de *{sym(coin_id)}*.\n\n"
+                f"Puedes indicar el precio manualmente:\n"
+                f"`/compra {sym(coin_id)} {units} <precio>`\n\n"
+                f"Ejemplo: `/compra {sym(coin_id)} {units} 0.00001`",
+                parse_mode="Markdown",
+            )
             return
         buy_price = info[coin_id]["usd"]
 
@@ -698,7 +783,12 @@ async def cmd_precio(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     info = get_prices([coin_id])
     if not info or coin_id not in info:
-        await update.message.reply_text("❌ No pude obtener el precio.")
+        await update.message.reply_text(
+            f"⚠️ No pude obtener el precio de *{sym(coin_id)}* ahora mismo.\n\n"
+            f"CoinGecko puede estar limitando las peticiones. Espera 30 segundos e inténtalo de nuevo.\n\n"
+            f"Si el problema persiste puede ser que esta moneda tenga muy poco volumen.",
+            parse_mode="Markdown",
+        )
         return
     d = info[coin_id]
     await update.message.reply_text(
@@ -723,7 +813,12 @@ async def cmd_analizar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         msg = await update.message.reply_text(f"🔍 Analizando {sym(coin_id)}...")
         info = get_prices([coin_id])
         if not info or coin_id not in info:
-            await msg.edit_text("❌ No pude obtener datos.")
+            await msg.edit_text(
+                f"⚠️ No pude obtener datos de *{sym(coin_id)}* ahora mismo.\n\n"
+                f"CoinGecko puede estar limitando las peticiones \\(máx 30/min en plan gratuito\\)\\.\n"
+                f"Espera 30\\-60 segundos e inténtalo de nuevo\\.",
+                parse_mode="MarkdownV2",
+            )
             return
         a = full_analysis(coin_id, info[coin_id])
         await msg.edit_text(
