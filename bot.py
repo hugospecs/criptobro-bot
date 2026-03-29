@@ -328,51 +328,53 @@ def full_analysis(coin_id, price_info):
     }
 
 def build_analysis_msg(coin_id, a, holding=None):
+    price = a["price"]
     lines = [
         f"📊 *{sym(coin_id)} — {coin_name(coin_id)}*",
-        f"💰 Precio: *{fp(a['price'])}*",
-        f"24h: {pc(a['chg24'])}   7d: {pc(a['chg7'])}",
+        f"💰 *{fp(price)}*   24h: {pc(a['chg24'])}   7d: {pc(a['chg7'])}",
         "",
-        "━━━ ANÁLISIS DIARIO ━━━",
-        f"*Señal:* {a['signal']}",
-        f"*Confianza:* {a['confidence']}%",
-        f"RSI: `{a['rsi']}`   EMA7: `{fp(a['ema7'])}`   EMA14: `{fp(a['ema14'])}`",
-        f"Bollinger: `{a['bb_pos']:.0f}%` (0=suelo · 100=techo)",
-        f"🎯 Objetivo: `{fp(a['target'])}` (+{((a['target']/a['price']-1)*100):.1f}%)" if a['price'] else "",
-        f"🛑 Stop-loss: `{fp(a['stop_loss'])}` (-{((1-a['stop_loss']/a['price'])*100):.1f}%)" if a['price'] else "",
-        "",
-        "*Razones:*",
+        "┌─ AHORA (diario) ─────────────────",
+        f"│ {a['signal']}",
+        f"│ Confianza: {a['confidence']}%",
+        f"│ RSI: `{a['rsi']}`   Bollinger: `{a['bb_pos']:.0f}%`",
+        f"│ 🎯 Objetivo: `{fp(a['target'])}` (+{((a['target']/price-1)*100):.1f}%)" if price else "│",
+        f"│ 🛑 Stop-loss: `{fp(a['stop_loss'])}` (-{((1-a['stop_loss']/price)*100):.1f}%)" if price else "│",
+        "│",
+        "│ Razones principales:",
     ]
-    for r in a["reasons"][:5]:
-        lines.append(f"  → {r}")
+    for r in a["reasons"][:4]:
+        lines.append(f"│  · {r}")
 
     lines += [
-        "",
-        "━━━ ANÁLISIS 4H ━━━",
-        f"*Señal corto plazo:* {a['signal_4h']}",
-        f"*Confianza 4h:* {a['confidence_4h']}%",
+        "│",
+        "└─ PREDICCIÓN 4H ──────────────────",
+        f"  {a['signal_4h']}",
+        f"  Confianza: {a['confidence_4h']}%",
     ]
-    for r in a["reasons_4h"]:
-        lines.append(f"  → {r}")
+    for r in a["reasons_4h"][:2]:
+        lines.append(f"  · {r}")
 
     if holding:
         units   = holding["units"]
         avg_buy = holding["avg_buy"]
-        current = a["price"] * units
+        current = price * units
         inv     = avg_buy * units
         profit  = current - inv
         pnl_pct = (profit / inv * 100) if inv else 0
         lines += [
             "",
-            "━━━ TU POSICIÓN ━━━",
-            f"📦 Unidades: `{units}`",
-            f"💵 Compra media: `{fp(avg_buy)}`",
-            f"💼 Valor actual: `{fp(current)}`",
-            f"{'💰' if profit >= 0 else '📉'} P&L: `{fp(profit)}` ({pnl_pct:+.2f}%)",
+            "┌─ TU POSICIÓN ────────────────────",
+            f"│ {units} uds · Compra media: {fp(avg_buy)}",
+            f"│ Valor: {fp(current)}",
+            f"└ {'💰' if profit >= 0 else '📉'} P&L: {fp(profit)} ({pnl_pct:+.2f}%)",
         ]
 
-    lines.append(f"\n_Análisis: {datetime.now().strftime('%d/%m %H:%M')}_")
+    lines.append(f"\n_🕐 {datetime.now().strftime('%d/%m %H:%M')}_")
     return "\n".join(l for l in lines if l is not None)
+
+async def cmd_cancelar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    state["cancel"] = True
+    await update.message.reply_text("🛑 Cancelando... el comando actual se detendrá en el siguiente paso.")
 
 # ── Chat IA ───────────────────────────────────────────────────────────────────
 def portfolio_ctx():
@@ -401,7 +403,7 @@ def ask_claude(user_msg):
                 "content-type": "application/json",
             },
             json={
-                "model": "claude-sonnet-4-20250514",
+                "model": "claude-sonnet-4-6",
                 "max_tokens": 800,
                 "system": (
                     "Eres un experto en trading de criptomonedas. Respondes en español, "
@@ -445,7 +447,9 @@ HELP = (
     "💬 *CHAT IA*\n"
     "  /chat ¿Vendo mi SOL? — Pregunta lo que quieras\n"
     "  Escribe sin / para chatear directamente\n"
-    "  /resetChat — Borrar historial\n"
+    "  /resetChat — Borrar historial\n\n"
+    "⚙️ *OTROS*\n"
+    "  /cancelar — Para cualquier comando en curso\n"
 )
 
 async def cmd_start(u, c): await u.message.reply_text(HELP, parse_mode="MarkdownV2")
@@ -675,75 +679,67 @@ async def cmd_analizar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 f"❌ No reconozco '{ctx.args[0]}'. Prueba /buscar {ctx.args[0]}"
             )
             return
-        msg  = await update.message.reply_text(
-            f"🔍 Analizando *{sym(coin_id)}* — obteniendo datos diarios y de las últimas 4h...",
+        msg = await update.message.reply_text(
+            f"🔍 Analizando *{sym(coin_id)}*...",
             parse_mode="Markdown",
         )
         info = get_prices([coin_id])
         if not info or coin_id not in info:
             await msg.edit_text(
-                "⚠️ No pude obtener datos de precio ahora mismo.\n"
-                "CoinGecko puede estar limitando peticiones. Espera 30s e inténtalo de nuevo."
+                "⚠️ No pude obtener datos ahora mismo.\n"
+                "CoinGecko puede estar limitando peticiones. Espera 30s e inténtalo."
             )
             return
         a = full_analysis(coin_id, info[coin_id])
-        holding = p.get(coin_id)
         await msg.edit_text(
-            build_analysis_msg(coin_id, a, holding=holding),
+            build_analysis_msg(coin_id, a, holding=p.get(coin_id)),
             parse_mode="Markdown",
         )
         return
 
-    # /analizar → toda la cartera
+    # /analizar sin parámetro → toda la cartera, un mensaje por moneda
     if not p:
         await update.message.reply_text(
-            "Tu cartera está vacía.\n\nUsa /compra BTC 0.5 para añadir criptos,\n"
+            "Tu cartera está vacía.\n\nUsa /compra BTC 0.5 para añadir criptos\n"
             "o /mercado para buscar oportunidades."
         )
         return
 
+    n   = len(p)
     msg = await update.message.reply_text(
-        f"🔍 Analizando {len(p)} activos de tu cartera (diario + 4h)...\n"
-        f"_Esto puede tardar {len(p)*5}–{len(p)*8} segundos._",
+        f"🔍 Analizando {n} activo{'s' if n > 1 else ''} de tu cartera...\n"
+        f"_~{n * 6} segundos. Escribe /cancelar para parar._",
         parse_mode="Markdown",
     )
-    data    = get_prices(list(p.keys()))
-    results = []
+    data = get_prices(list(p.keys()))
 
     for cid, pos in p.items():
+        # Comprobar si el usuario canceló
+        if state.get("cancel"):
+            state["cancel"] = False
+            await msg.edit_text("🛑 Análisis cancelado.")
+            return
+
         info = data.get(cid)
         if not info:
+            await update.message.reply_text(f"⚠️ Sin datos para {sym(cid)}, saltando.")
             continue
-        await msg.edit_text(
-            f"🔍 Analizando *{sym(cid)}*...",
-            parse_mode="Markdown",
-        )
+
+        await msg.edit_text(f"🔍 Analizando *{sym(cid)}*...", parse_mode="Markdown")
         a = full_analysis(cid, info)
-        results.append((cid, a, pos))
-        time.sleep(1.5)   # pausa entre monedas para no saturar rate limit
 
-    if not results:
-        await msg.edit_text("❌ No pude obtener datos del mercado ahora mismo. Intenta en 30 segundos.")
-        return
-
-    # Resumen
-    lines = [f"📊 *Resumen de tu cartera — {datetime.now().strftime('%H:%M')}*\n"]
-    for cid, a, pos in results:
-        pnl = ((a["price"] / pos["avg_buy"]) - 1) * 100 if pos["avg_buy"] else 0
-        lines.append(
-            f"{a['signal']} *{sym(cid)}*\n"
-            f"  Diario: {a['signal']} ({a['confidence']}%) · 4h: {a['signal_4h']} ({a['confidence_4h']}%)\n"
-            f"  P&L posición: {pnl:+.1f}%\n"
-        )
-    await msg.edit_text("\n".join(lines), parse_mode="Markdown")
-
-    # Detalle individual
-    for cid, a, pos in results:
+        # Un solo mensaje por moneda con todo incluido
         await update.message.reply_text(
             build_analysis_msg(cid, a, holding=pos),
             parse_mode="Markdown",
         )
-        time.sleep(0.5)
+        time.sleep(1.5)
+
+    await msg.edit_text(
+        f"✅ Análisis completado — {n} activo{'s' if n > 1 else ''}.\n"
+        f"_🕐 {datetime.now().strftime('%H:%M')}_",
+        parse_mode="Markdown",
+    )
 
 # ── Mercado ───────────────────────────────────────────────────────────────────
 async def cmd_mercado(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -903,6 +899,7 @@ def main():
     app.add_handler(CommandHandler("buscar",    cmd_buscar))
     app.add_handler(CommandHandler("analizar",  cmd_analizar))
     app.add_handler(CommandHandler("mercado",   cmd_mercado))
+    app.add_handler(CommandHandler("cancelar",  cmd_cancelar))
     app.add_handler(CommandHandler("chat",      cmd_chat))
     app.add_handler(CommandHandler("resetChat", cmd_reset_chat))
     app.add_handler(CallbackQueryHandler(callback_handler))
