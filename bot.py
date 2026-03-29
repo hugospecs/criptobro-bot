@@ -1,5 +1,5 @@
 """
-CRYPTO BOT PRO v5
+CRYPTO BOT PRO v9
 - Cartera personal
 - Análisis bajo demanda (sin monitor en background)
 - Análisis de mercado completo
@@ -420,12 +420,12 @@ def ask_claude(user_msg):
         r = requests.post(
             "https://api.anthropic.com/v1/messages",
             headers={
-                "x-api-key":          ANTHROPIC_KEY,
+                "x-api-key":          ANTHROPIC_KEY.strip(),
                 "anthropic-version":  "2023-06-01",
                 "content-type":       "application/json",
             },
             json={
-                "model":      "claude-haiku-4-5-20251001",  # modelo estable disponible
+                "model":      "claude-haiku-4-5-20251001",
                 "max_tokens": 800,
                 "system": (
                     "Eres un experto en trading de criptomonedas. Respondes en español, "
@@ -439,41 +439,50 @@ def ask_claude(user_msg):
         )
 
         if not r.ok:
-            # Loguear el cuerpo completo del error para diagnóstico
-            log.error("Claude API %d: %s", r.status_code, r.text)
-            # Si es 400 y hay historial, reintentar sin historial (puede estar corrupto)
-            if r.status_code == 400 and valid_history:
-                log.warning("Reintentando sin historial...")
-                state["chat_history"] = []
-                r2 = requests.post(
-                    "https://api.anthropic.com/v1/messages",
-                    headers={
-                        "x-api-key":          ANTHROPIC_KEY,
-                        "anthropic-version":  "2023-06-01",
-                        "content-type":       "application/json",
-                    },
-                    json={
-                        "model":      "claude-haiku-4-5-20251001",
-                        "max_tokens": 800,
-                        "system": (
-                            "Eres un experto en trading de criptomonedas. Respondes en español, "
-                            "formato Telegram (*negrita*, _cursiva_). Eres claro, honesto y siempre "
-                            "adviertes que el trading conlleva riesgo.\n"
-                            f"Cartera actual del usuario:\n{portfolio_ctx()}"
-                        ),
-                        "messages": [{"role": "user", "content": user_msg}],
-                    },
-                    timeout=30,
-                )
-                if r2.ok:
-                    reply = r2.json()["content"][0]["text"]
-                    state["chat_history"] = [
-                        {"role": "user",      "content": user_msg},
-                        {"role": "assistant", "content": reply},
-                    ]
-                    return reply
-                return f"❌ Error de API ({r2.status_code}). Comprueba que la ANTHROPIC\\_KEY es correcta."
-            return f"❌ Error de API ({r.status_code}). Comprueba que la ANTHROPIC\\_KEY es correcta."
+            error_body = r.json() if r.headers.get("content-type","").startswith("application/json") else r.text
+            log.error("Claude API %d: %s", r.status_code, error_body)
+
+            # Mensaje de diagnóstico detallado
+            if r.status_code == 401:
+                return "❌ *API Key inválida* — La ANTHROPIC\\_KEY en Railway es incorrecta o ha expirado. Ve a console.anthropic.com y genera una nueva."
+            if r.status_code == 400:
+                err_msg = error_body.get("error", {}).get("message", str(error_body)) if isinstance(error_body, dict) else str(error_body)
+                # Si falla con historial, reintentar sin él
+                if valid_history:
+                    log.warning("400 con historial — reintentando sin historial. Error: %s", err_msg)
+                    state["chat_history"] = []
+                    r2 = requests.post(
+                        "https://api.anthropic.com/v1/messages",
+                        headers={
+                            "x-api-key":         ANTHROPIC_KEY.strip(),
+                            "anthropic-version": "2023-06-01",
+                            "content-type":      "application/json",
+                        },
+                        json={
+                            "model":      "claude-haiku-4-5-20251001",
+                            "max_tokens": 800,
+                            "system": (
+                                "Eres un experto en trading de criptomonedas. Respondes en español, "
+                                "formato Telegram (*negrita*, _cursiva_). Eres claro, honesto y siempre "
+                                "adviertes que el trading conlleva riesgo.\n"
+                                f"Cartera actual del usuario:\n{portfolio_ctx()}"
+                            ),
+                            "messages": [{"role": "user", "content": user_msg}],
+                        },
+                        timeout=30,
+                    )
+                    if r2.ok:
+                        reply = r2.json()["content"][0]["text"]
+                        state["chat_history"] = [
+                            {"role": "user",      "content": user_msg},
+                            {"role": "assistant", "content": reply},
+                        ]
+                        return reply
+                    err2 = r2.json() if r2.headers.get("content-type","").startswith("application/json") else r2.text
+                    log.error("Reintento sin historial también falló %d: %s", r2.status_code, err2)
+                    return f"❌ Error 400 persistente: `{err2.get('error',{}).get('message', str(err2)) if isinstance(err2,dict) else err2}`"
+                return f"❌ Error 400: `{err_msg}`"
+            return f"❌ Error de API ({r.status_code})"
 
         reply = r.json()["content"][0]["text"]
         state["chat_history"].append({"role": "user",      "content": user_msg})
