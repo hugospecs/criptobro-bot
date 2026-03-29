@@ -393,38 +393,100 @@ def ask_claude(user_msg):
             "Añade la variable `ANTHROPIC_KEY` en Railway con tu API key de Anthropic.\n"
             "Puedes obtenerla en console.anthropic.com"
         )
-    history = state["chat_history"][-12:]
+
+    # Limpiar historial: eliminar entradas vacías o mal formadas
+    clean_history = [
+        m for m in state["chat_history"]
+        if isinstance(m, dict)
+        and m.get("role") in ("user", "assistant")
+        and isinstance(m.get("content"), str)
+        and m["content"].strip()
+    ]
+    # Asegurarse de que el historial alterna user/assistant correctamente
+    # (la API falla si hay dos mensajes seguidos del mismo rol)
+    valid_history = []
+    last_role = None
+    for m in clean_history[-12:]:
+        if m["role"] != last_role:
+            valid_history.append(m)
+            last_role = m["role"]
+    # El último mensaje del historial no puede ser del assistant (el nuevo user va a continuación)
+    if valid_history and valid_history[-1]["role"] == "assistant":
+        valid_history = valid_history[:-1]
+
+    messages = valid_history + [{"role": "user", "content": user_msg}]
+
     try:
         r = requests.post(
             "https://api.anthropic.com/v1/messages",
             headers={
-                "x-api-key": ANTHROPIC_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
+                "x-api-key":          ANTHROPIC_KEY,
+                "anthropic-version":  "2023-06-01",
+                "content-type":       "application/json",
             },
             json={
-                "model": "claude-sonnet-4-6",
+                "model":      "claude-haiku-4-5-20251001",  # modelo estable disponible
                 "max_tokens": 800,
                 "system": (
                     "Eres un experto en trading de criptomonedas. Respondes en español, "
                     "formato Telegram (*negrita*, _cursiva_). Eres claro, honesto y siempre "
-                    "adviertes que el trading conlleva riesgo. "
+                    "adviertes que el trading conlleva riesgo.\n"
                     f"Cartera actual del usuario:\n{portfolio_ctx()}"
                 ),
-                "messages": history + [{"role": "user", "content": user_msg}],
+                "messages": messages,
             },
             timeout=30,
         )
-        r.raise_for_status()
+
+        if not r.ok:
+            # Loguear el cuerpo completo del error para diagnóstico
+            log.error("Claude API %d: %s", r.status_code, r.text)
+            # Si es 400 y hay historial, reintentar sin historial (puede estar corrupto)
+            if r.status_code == 400 and valid_history:
+                log.warning("Reintentando sin historial...")
+                state["chat_history"] = []
+                r2 = requests.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers={
+                        "x-api-key":          ANTHROPIC_KEY,
+                        "anthropic-version":  "2023-06-01",
+                        "content-type":       "application/json",
+                    },
+                    json={
+                        "model":      "claude-haiku-4-5-20251001",
+                        "max_tokens": 800,
+                        "system": (
+                            "Eres un experto en trading de criptomonedas. Respondes en español, "
+                            "formato Telegram (*negrita*, _cursiva_). Eres claro, honesto y siempre "
+                            "adviertes que el trading conlleva riesgo.\n"
+                            f"Cartera actual del usuario:\n{portfolio_ctx()}"
+                        ),
+                        "messages": [{"role": "user", "content": user_msg}],
+                    },
+                    timeout=30,
+                )
+                if r2.ok:
+                    reply = r2.json()["content"][0]["text"]
+                    state["chat_history"] = [
+                        {"role": "user",      "content": user_msg},
+                        {"role": "assistant", "content": reply},
+                    ]
+                    return reply
+                return f"❌ Error de API ({r2.status_code}). Comprueba que la ANTHROPIC\\_KEY es correcta."
+            return f"❌ Error de API ({r.status_code}). Comprueba que la ANTHROPIC\\_KEY es correcta."
+
         reply = r.json()["content"][0]["text"]
         state["chat_history"].append({"role": "user",      "content": user_msg})
         state["chat_history"].append({"role": "assistant", "content": reply})
         if len(state["chat_history"]) > 40:
             state["chat_history"] = state["chat_history"][-40:]
         return reply
+
+    except requests.exceptions.Timeout:
+        return "⚠️ La IA tardó demasiado en responder. Inténtalo de nuevo."
     except Exception as e:
-        log.error("Claude API: %s", e)
-        return f"❌ Error al contactar con la IA: {e}"
+        log.error("Claude API excepción: %s", e)
+        return f"❌ Error inesperado: {e}"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # COMANDOS
