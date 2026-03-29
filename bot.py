@@ -1,5 +1,5 @@
 """
-CRYPTO BOT PRO v9
+CRYPTO BOT PRO v5
 - Cartera personal
 - Análisis bajo demanda (sin monitor en background)
 - Análisis de mercado completo
@@ -387,114 +387,80 @@ def portfolio_ctx():
     )
 
 def ask_claude(user_msg):
-    if not ANTHROPIC_KEY:
+    """Chat IA usando Google Gemini (tier gratuito, sin tarjeta)."""
+    gemini_key = os.environ.get("GEMINI_KEY", "")
+    if not gemini_key:
         return (
             "⚠️ *Chat IA no disponible*\n\n"
-            "Añade la variable `ANTHROPIC_KEY` en Railway con tu API key de Anthropic.\n"
-            "Puedes obtenerla en console.anthropic.com"
+            "Añade la variable `GEMINI_KEY` en Railway con tu API key de Google AI Studio.\n"
+            "Consíguela gratis en: *aistudio.google.com* → Get API Key\n"
+            "_(No requiere tarjeta de crédito)_"
         )
 
-    # Limpiar historial: eliminar entradas vacías o mal formadas
-    clean_history = [
+    # Limpiar y validar historial (Gemini requiere alternancia user/model)
+    clean = [
         m for m in state["chat_history"]
         if isinstance(m, dict)
-        and m.get("role") in ("user", "assistant")
-        and isinstance(m.get("content"), str)
-        and m["content"].strip()
+        and m.get("role") in ("user", "model")
+        and isinstance(m.get("parts"), list)
+        and m["parts"]
+        and isinstance(m["parts"][0].get("text"), str)
+        and m["parts"][0]["text"].strip()
     ]
-    # Asegurarse de que el historial alterna user/assistant correctamente
-    # (la API falla si hay dos mensajes seguidos del mismo rol)
-    valid_history = []
+    # Garantizar alternancia correcta
+    valid = []
     last_role = None
-    for m in clean_history[-12:]:
+    for m in clean[-12:]:
         if m["role"] != last_role:
-            valid_history.append(m)
+            valid.append(m)
             last_role = m["role"]
-    # El último mensaje del historial no puede ser del assistant (el nuevo user va a continuación)
-    if valid_history and valid_history[-1]["role"] == "assistant":
-        valid_history = valid_history[:-1]
+    if valid and valid[-1]["role"] == "model":
+        valid = valid[:-1]
 
-    messages = valid_history + [{"role": "user", "content": user_msg}]
+    system_text = (
+        "Eres un experto en trading de criptomonedas. Respondes en español, "
+        "usando formato Telegram (*negrita*, _cursiva_). Eres claro, honesto y siempre "
+        "adviertes que el trading conlleva riesgo.\n"
+        f"Cartera actual del usuario:\n{portfolio_ctx()}"
+    )
+
+    # Gemini REST API
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={gemini_key.strip()}"
+    payload = {
+        "system_instruction": {"parts": [{"text": system_text}]},
+        "contents": valid + [{"role": "user", "parts": [{"text": user_msg}]}],
+        "generationConfig": {"maxOutputTokens": 800, "temperature": 0.7},
+    }
 
     try:
-        r = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key":          ANTHROPIC_KEY.strip(),
-                "anthropic-version":  "2023-06-01",
-                "content-type":       "application/json",
-            },
-            json={
-                "model":      "claude-haiku-4-5-20251001",
-                "max_tokens": 800,
-                "system": (
-                    "Eres un experto en trading de criptomonedas. Respondes en español, "
-                    "formato Telegram (*negrita*, _cursiva_). Eres claro, honesto y siempre "
-                    "adviertes que el trading conlleva riesgo.\n"
-                    f"Cartera actual del usuario:\n{portfolio_ctx()}"
-                ),
-                "messages": messages,
-            },
-            timeout=30,
-        )
+        r = requests.post(url, json=payload, timeout=30)
 
         if not r.ok:
-            error_body = r.json() if r.headers.get("content-type","").startswith("application/json") else r.text
-            log.error("Claude API %d: %s", r.status_code, error_body)
-
-            # Mensaje de diagnóstico detallado
-            if r.status_code == 401:
-                return "❌ *API Key inválida* — La ANTHROPIC\\_KEY en Railway es incorrecta o ha expirado. Ve a console.anthropic.com y genera una nueva."
+            body = r.json() if "application/json" in r.headers.get("content-type", "") else {}
+            err  = body.get("error", {}).get("message", r.text)
+            log.error("Gemini API %d: %s", r.status_code, err)
             if r.status_code == 400:
-                err_msg = error_body.get("error", {}).get("message", str(error_body)) if isinstance(error_body, dict) else str(error_body)
-                # Si falla con historial, reintentar sin él
-                if valid_history:
-                    log.warning("400 con historial — reintentando sin historial. Error: %s", err_msg)
-                    state["chat_history"] = []
-                    r2 = requests.post(
-                        "https://api.anthropic.com/v1/messages",
-                        headers={
-                            "x-api-key":         ANTHROPIC_KEY.strip(),
-                            "anthropic-version": "2023-06-01",
-                            "content-type":      "application/json",
-                        },
-                        json={
-                            "model":      "claude-haiku-4-5-20251001",
-                            "max_tokens": 800,
-                            "system": (
-                                "Eres un experto en trading de criptomonedas. Respondes en español, "
-                                "formato Telegram (*negrita*, _cursiva_). Eres claro, honesto y siempre "
-                                "adviertes que el trading conlleva riesgo.\n"
-                                f"Cartera actual del usuario:\n{portfolio_ctx()}"
-                            ),
-                            "messages": [{"role": "user", "content": user_msg}],
-                        },
-                        timeout=30,
-                    )
-                    if r2.ok:
-                        reply = r2.json()["content"][0]["text"]
-                        state["chat_history"] = [
-                            {"role": "user",      "content": user_msg},
-                            {"role": "assistant", "content": reply},
-                        ]
-                        return reply
-                    err2 = r2.json() if r2.headers.get("content-type","").startswith("application/json") else r2.text
-                    log.error("Reintento sin historial también falló %d: %s", r2.status_code, err2)
-                    return f"❌ Error 400 persistente: `{err2.get('error',{}).get('message', str(err2)) if isinstance(err2,dict) else err2}`"
-                return f"❌ Error 400: `{err_msg}`"
-            return f"❌ Error de API ({r.status_code})"
+                return f"❌ Error Gemini 400: `{err}`"
+            if r.status_code == 403:
+                return "❌ *API Key inválida* — Comprueba que la GEMINI\\_KEY en Railway es correcta."
+            if r.status_code == 429:
+                return "⚠️ Límite de peticiones alcanzado. Espera 1 minuto e inténtalo de nuevo."
+            return f"❌ Error Gemini ({r.status_code}): `{err}`"
 
-        reply = r.json()["content"][0]["text"]
-        state["chat_history"].append({"role": "user",      "content": user_msg})
-        state["chat_history"].append({"role": "assistant", "content": reply})
+        data    = r.json()
+        reply   = data["candidates"][0]["content"]["parts"][0]["text"]
+
+        # Guardar en historial con formato Gemini (role: user/model)
+        state["chat_history"].append({"role": "user",  "parts": [{"text": user_msg}]})
+        state["chat_history"].append({"role": "model", "parts": [{"text": reply}]})
         if len(state["chat_history"]) > 40:
             state["chat_history"] = state["chat_history"][-40:]
         return reply
 
     except requests.exceptions.Timeout:
-        return "⚠️ La IA tardó demasiado en responder. Inténtalo de nuevo."
+        return "⚠️ Gemini tardó demasiado. Inténtalo de nuevo."
     except Exception as e:
-        log.error("Claude API excepción: %s", e)
+        log.error("Gemini excepción: %s", e)
         return f"❌ Error inesperado: {e}"
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -518,7 +484,8 @@ HELP = (
     "💬 *CHAT IA*\n"
     "  /chat ¿Vendo mi SOL? — Pregunta lo que quieras\n"
     "  Escribe sin / para chatear directamente\n"
-    "  /resetChat — Borrar historial\n\n"
+    "  /resetChat — Borrar historial\n"
+    "  _\\(Requiere GEMINI\\_KEY en Railway\\)_\n\n"
     "⚙️ *OTROS*\n"
     "  /cancelar — Para cualquier comando en curso\n"
 )
