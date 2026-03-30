@@ -1,5 +1,5 @@
 """
-CRYPTO BOT PRO v11
+CRYPTO BOT PRO v12
 - Todo async: ninguna llamada bloquea el bot
 - Chat IA con Gemini (gratuito)
 - /mercado carga TOP_IDS al arrancar de forma async
@@ -351,82 +351,90 @@ def _portfolio_ctx():
     )
 
 def _call_gemini(user_msg):
-    """Llamada síncrona a Gemini — se ejecuta en executor."""
     if not GEMINI_KEY:
         return (
-            "⚠️ *Chat IA no disponible*\n\n"
-            "Añade la variable `GEMINI_KEY` en Railway.\n"
-            "Consíguela gratis en *aistudio.google.com* → Get API Key"
+            "⚠️ Chat IA no disponible\n\n"
+            "Añade la variable GEMINI_KEY en Railway.\n"
+            "Consíguela gratis en aistudio.google.com → Get API Key"
         )
 
-    # Limpiar historial: solo entradas válidas con alternancia correcta
+    # Historial limpio: solo últimos 6 turnos, alternancia correcta
     clean, last_role = [], None
-    for m in state["chat_history"][-16:]:
+    for m in state["chat_history"][-12:]:
         if (isinstance(m, dict)
                 and m.get("role") in ("user", "model")
                 and isinstance(m.get("parts"), list)
                 and m["parts"]
-                and m["parts"][0].get("text", "").strip()
+                and str(m["parts"][0].get("text", "")).strip()
                 and m["role"] != last_role):
             clean.append(m)
             last_role = m["role"]
-    # El último no puede ser model
     if clean and clean[-1]["role"] == "model":
         clean = clean[:-1]
 
     payload = {
         "system_instruction": {"parts": [{"text": (
-            "Eres un experto en trading de criptomonedas. Respondes siempre en español, "
-            "usando formato Telegram (*negrita*, _cursiva_). Eres claro, conciso y honesto. "
-            "Siempre adviertes que el trading conlleva riesgo.\n"
-            f"Cartera actual del usuario:\n{_portfolio_ctx()}"
+            "Eres un asesor de trading de criptomonedas. "
+            "REGLAS IMPORTANTES:\n"
+            "1. Responde SIEMPRE en español\n"
+            "2. Respuestas CORTAS y DIRECTAS, máximo 5-6 líneas\n"
+            "3. Sin saludos ni introducciones largas\n"
+            "4. Sin formato markdown complejo, solo texto plano con algún emoji\n"
+            "5. Ve directo al grano con la recomendación\n"
+            "6. Siempre advierte brevemente el riesgo al final\n"
+            f"Cartera del usuario:\n{_portfolio_ctx()}"
         )}]},
         "contents": clean + [{"role": "user", "parts": [{"text": user_msg}]}],
-        "generationConfig": {"maxOutputTokens": 600, "temperature": 0.7},
+        "generationConfig": {
+            "maxOutputTokens": 250,   # respuestas cortas para no cortar
+            "temperature": 0.5,
+        },
     }
 
-    r = _post(f"{GEMINI_URL}?key={GEMINI_KEY.strip()}", payload)
-    if r is None:
-        return "⚠️ No pude conectar con Gemini. Inténtalo de nuevo."
+    try:
+        r = _post(f"{GEMINI_URL}?key={GEMINI_KEY.strip()}", payload)
+        if r is None:
+            return "⚠️ Sin conexión con Gemini. Inténtalo de nuevo."
 
-    if not r.ok:
-        try:
-            err = r.json().get("error", {}).get("message", r.text)
-        except Exception:
-            err = r.text
-        log.error("Gemini %d: %s", r.status_code, err)
-        if r.status_code == 400:
-            # Reintentar sin historial por si está corrupto
-            if clean:
-                log.warning("400 con historial — reintentando sin historial")
+        if not r.ok:
+            try:
+                err = r.json().get("error", {}).get("message", r.text)
+            except Exception:
+                err = r.text
+            log.error("Gemini %d: %s", r.status_code, err)
+            if r.status_code == 400 and clean:
+                # Reintentar sin historial
                 state["chat_history"] = []
                 payload2 = {**payload, "contents": [{"role": "user", "parts": [{"text": user_msg}]}]}
                 r2 = _post(f"{GEMINI_URL}?key={GEMINI_KEY.strip()}", payload2)
                 if r2 and r2.ok:
-                    reply = r2.json()["candidates"][0]["content"]["parts"][0]["text"]
+                    reply = r2.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
                     state["chat_history"] = [
                         {"role": "user",  "parts": [{"text": user_msg}]},
                         {"role": "model", "parts": [{"text": reply}]},
                     ]
                     return reply
-            return f"❌ Error Gemini 400: `{err}`"
-        if r.status_code == 403:
-            return "❌ GEMINI\\_KEY inválida. Compruébala en Railway."
-        if r.status_code == 429:
-            return "⚠️ Límite de Gemini alcanzado. Espera 1 minuto."
-        return f"❌ Error Gemini ({r.status_code})"
+            if r.status_code == 403:
+                return "❌ GEMINI_KEY inválida. Compruébala en Railway."
+            if r.status_code == 429:
+                return "⚠️ Límite de Gemini alcanzado. Espera 1 minuto."
+            return f"❌ Error Gemini ({r.status_code})"
 
-    try:
-        reply = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+        reply = r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+
+        # Guardar en historial
+        state["chat_history"].append({"role": "user",  "parts": [{"text": user_msg}]})
+        state["chat_history"].append({"role": "model", "parts": [{"text": reply}]})
+        if len(state["chat_history"]) > 20:
+            state["chat_history"] = state["chat_history"][-20:]
+        return reply
+
     except (KeyError, IndexError) as e:
-        log.error("Gemini respuesta inesperada: %s — %s", e, r.text[:200])
-        return "⚠️ Gemini devolvió una respuesta inesperada. Inténtalo de nuevo."
-
-    state["chat_history"].append({"role": "user",  "parts": [{"text": user_msg}]})
-    state["chat_history"].append({"role": "model", "parts": [{"text": reply}]})
-    if len(state["chat_history"]) > 40:
-        state["chat_history"] = state["chat_history"][-40:]
-    return reply
+        log.error("Gemini respuesta inesperada: %s", e)
+        return "⚠️ Gemini devolvió una respuesta vacía. Inténtalo de nuevo."
+    except Exception as e:
+        log.error("Gemini excepción: %s", e)
+        return f"❌ Error inesperado: {e}"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # COMANDOS
@@ -748,18 +756,50 @@ async def cmd_cancelar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🛑 Cancelando en el siguiente paso...")
 
 # ── Chat IA ───────────────────────────────────────────────────────────────────
+async def _send_reply(update, msg, reply):
+    """Envía la respuesta dividiendo si supera el límite de Telegram."""
+    # Quitar markdown complejo que Telegram puede rechazar
+    safe = (reply
+        .replace("**", "*")
+        .replace("__", "_")
+        .strip())
+
+    MAX = 3800  # margen bajo el límite de 4096
+    if len(safe) <= MAX:
+        try:
+            await msg.edit_text(safe, parse_mode="Markdown")
+        except Exception:
+            await msg.edit_text(safe)
+    else:
+        # Dividir en trozos por párrafos
+        await msg.delete()
+        partes = []
+        actual = ""
+        for linea in safe.split("\n"):
+            if len(actual) + len(linea) + 1 > MAX:
+                if actual:
+                    partes.append(actual.strip())
+                actual = linea
+            else:
+                actual += "\n" + linea if actual else linea
+        if actual:
+            partes.append(actual.strip())
+        for parte in partes:
+            try:
+                await update.message.reply_text(parte, parse_mode="Markdown")
+            except Exception:
+                await update.message.reply_text(parte)
+
 async def cmd_chat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.args:
         await update.message.reply_text(
-            "Uso: `/chat ¿Debo vender mi ETH?`\nO escribe directamente sin /chat.",
-            parse_mode="Markdown"); return
+            "Uso: /chat ¿Debo vender mi ETH?\nO escribe directamente sin /chat."
+        )
+        return
     user_msg = " ".join(ctx.args)
     msg      = await update.message.reply_text("🧠 Pensando...")
     reply    = await run(_call_gemini, user_msg)
-    try:
-        await msg.edit_text(reply, parse_mode="Markdown")
-    except Exception:
-        await msg.edit_text(reply)   # fallback sin formato si hay caracteres raros
+    await _send_reply(update, msg, reply)
 
 async def cmd_reset_chat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     state["chat_history"] = []
@@ -767,13 +807,11 @@ async def cmd_reset_chat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_msg = (update.message.text or "").strip()
-    if not user_msg: return
+    if not user_msg:
+        return
     msg   = await update.message.reply_text("🧠 Pensando...")
     reply = await run(_call_gemini, user_msg)
-    try:
-        await msg.edit_text(reply, parse_mode="Markdown")
-    except Exception:
-        await msg.edit_text(reply)
+    await _send_reply(update, msg, reply)
 
 # ── Callbacks inline ──────────────────────────────────────────────────────────
 async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
