@@ -1,13 +1,19 @@
 """
-CRYPTO BOT PRO v14 — Gestor de Cartera Proactivo
+CRYPTO BOT PRO v15 — Escáner de Mercado Activo
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-· Todo en EUROS (€)
-· Monitor 4h: alertas de venta, DCA, trailing stop, volatilidad
-· Reporte detallado: top ganador, top perdedor, dominancia BTC
-· Trailing stop dinámico si beneficio > 5%
-· Detector de oportunidad DCA (-10% + RSI<35)
-· Detector de volatilidad (movimiento >5% en 4h)
-· Scanner de mercado /mercado
+MONITOR DUAL cada 4h:
+  Fase A — Gestión de cartera (v14 completa):
+    · Alertas de venta técnica
+    · Oportunidad DCA (-10% avg_buy + RSI<35)
+    · Trailing stop dinámico (break-even +1%)
+    · Detector de volatilidad (>5% en 4h)
+    · Toma de ganancias (>10% + señal neutral)
+  Fase B — Market Hunter (nuevo en v15):
+    · Escanea top 100 por capitalización
+    · Filtro "Francotirador": caída>10% + RSI<30 + score>=5
+    · Alerta diferenciada: 🎯 OPORTUNIDAD DE ENTRADA
+
+Todo en EUROS (€)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
@@ -21,32 +27,36 @@ from telegram.ext import (
 )
 
 # ── Config ────────────────────────────────────────────────────────────────────
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
-CHAT_ID        = os.environ.get("CHAT_ID", "")
-PORTFOLIO_FILE = "portfolio.json"
-GECKO          = "https://api.coingecko.com/api/v3"
-CURRENCY       = "eur"          # moneda base
-CURRENCY_SYM   = "€"
-MONITOR_HOURS  = 4              # análisis automático cada N horas
-PROFIT_ALERT   = 10.0           # % beneficio para sugerir toma de ganancias
-SELL_CONF_MIN  = 60             # confianza mínima para alertas de venta
-DCA_DROP_PCT   = 10.0           # caída % sobre avg_buy para sugerir DCA
-TRAILING_MIN_PROFIT = 5.0       # % beneficio mínimo para activar trailing stop
-VOLATILITY_PCT = 5.0            # % de movimiento en 4h para alerta de volatilidad
+TELEGRAM_TOKEN      = os.environ.get("TELEGRAM_TOKEN", "")
+CHAT_ID             = os.environ.get("CHAT_ID", "")
+PORTFOLIO_FILE      = "portfolio.json"
+GECKO               = "https://api.coingecko.com/api/v3"
+CURRENCY            = "eur"
+CURRENCY_SYM        = "€"
+MONITOR_HOURS       = 4
+PROFIT_ALERT        = 10.0
+SELL_CONF_MIN       = 60
+DCA_DROP_PCT        = 10.0
+TRAILING_MIN_PROFIT = 5.0
+VOLATILITY_PCT      = 5.0
+# Filtros del Market Hunter (Fase B)
+HUNTER_DROP_24H     = 10.0   # caída mínima en 24h para considerar una moneda
+HUNTER_RSI_MAX      = 30     # RSI máximo (sobreventa confirmada)
+HUNTER_SCORE_MIN    = 5      # score técnico mínimo (señal fuerte)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
 # ── Catálogo ──────────────────────────────────────────────────────────────────
-CATALOGUE = {}   # coin_id → {symbol, name}
-TOP_IDS   = []   # top 300 por market cap
+CATALOGUE = {}
+TOP_IDS   = []
 
 # ── Estado ────────────────────────────────────────────────────────────────────
 state = {
-    "portfolio":      {},    # {coin_id: {units, avg_buy, last_price}}
-    "cancel":         False,
-    "last_monitor":   None,
-    "prev_prices":    {},    # {coin_id: price} del ciclo anterior para detectar volatilidad
+    "portfolio":    {},
+    "cancel":       False,
+    "last_monitor": None,
+    "prev_prices":  {},
 }
 
 def load_state():
@@ -54,7 +64,7 @@ def load_state():
         try:
             with open(PORTFOLIO_FILE) as f:
                 saved = json.load(f)
-                state["portfolio"]   = saved.get("portfolio", {})
+                state["portfolio"]  = saved.get("portfolio", {})
                 state["prev_prices"] = saved.get("prev_prices", {})
             log.info("Cartera cargada: %d activos", len(state["portfolio"]))
         except Exception as e:
@@ -64,7 +74,7 @@ def save_state():
     try:
         with open(PORTFOLIO_FILE, "w") as f:
             json.dump({
-                "portfolio":   state["portfolio"],
+                "portfolio":  state["portfolio"],
                 "prev_prices": state["prev_prices"],
             }, f, indent=2)
     except Exception as e:
@@ -97,7 +107,7 @@ async def run(fn, *args, **kwargs):
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, partial(fn, *args, **kwargs))
 
-# ── CoinGecko API (todo en EUR) ───────────────────────────────────────────────
+# ── CoinGecko API ─────────────────────────────────────────────────────────────
 def _fetch_prices(coin_ids):
     import time
     if not coin_ids:
@@ -106,12 +116,12 @@ def _fetch_prices(coin_ids):
     ids = list(dict.fromkeys(coin_ids))
     for i in range(0, len(ids), 50):
         data = _get(f"{GECKO}/simple/price", {
-            "ids":                  ",".join(ids[i:i+50]),
-            "vs_currencies":        CURRENCY,
-            "include_24hr_change":  "true",
-            "include_7d_change":    "true",
-            "include_24hr_vol":     "true",
-            "include_market_cap":   "true",
+            "ids":                 ",".join(ids[i:i+50]),
+            "vs_currencies":       CURRENCY,
+            "include_24hr_change": "true",
+            "include_7d_change":   "true",
+            "include_24hr_vol":    "true",
+            "include_market_cap":  "true",
         })
         if data:
             result.update(data)
@@ -128,8 +138,6 @@ def _fetch_history(coin_id, days=30):
     return [p[1] for p in data.get("prices", [])] if data else []
 
 def _fetch_ohlc(coin_id, days=2):
-    # OHLC de CoinGecko devuelve siempre en USD internamente pero los valores
-    # relativos sirven igual para los indicadores técnicos
     return _get(f"{GECKO}/coins/{coin_id}/ohlc", {
         "vs_currency": CURRENCY,
         "days":        days,
@@ -160,16 +168,17 @@ def _fetch_top_ids():
     log.info("TOP_IDS: %d", len(TOP_IDS))
 
 def _fetch_top_markets():
+    """Top 100 monedas con precios incluidos (para /mercado y Market Hunter)."""
     import time
     result = []
     for page in [1, 2]:
         data = _get(f"{GECKO}/coins/markets", {
-            "vs_currency":              CURRENCY,
-            "order":                    "market_cap_desc",
-            "per_page":                 50,
-            "page":                     page,
-            "sparkline":                "false",
-            "price_change_percentage":  "24h,7d",
+            "vs_currency":             CURRENCY,
+            "order":                   "market_cap_desc",
+            "per_page":                50,
+            "page":                    page,
+            "sparkline":               "false",
+            "price_change_percentage": "24h,7d",
         })
         if data:
             result.extend(data)
@@ -177,17 +186,80 @@ def _fetch_top_markets():
     return result
 
 def _fetch_global():
-    """Dominancia de BTC y capitalización global."""
     data = _get(f"{GECKO}/global")
     if data:
         gd = data.get("data", {})
-        btc_dom   = gd.get("market_cap_percentage", {}).get("btc", 0)
-        total_cap = gd.get("total_market_cap", {}).get(CURRENCY, 0)
-        chg_24h   = gd.get("market_cap_change_percentage_24h_usd", 0)  # % no tiene moneda
-        return {"btc_dominance": round(btc_dom, 1),
-                "total_cap_eur": total_cap,
-                "cap_change_24h": round(chg_24h, 2)}
+        return {
+            "btc_dominance":  round(gd.get("market_cap_percentage", {}).get("btc", 0), 1),
+            "total_cap_eur":  gd.get("total_market_cap", {}).get(CURRENCY, 0),
+            "cap_change_24h": round(gd.get("market_cap_change_percentage_24h_usd", 0), 2),
+        }
     return {"btc_dominance": 0, "total_cap_eur": 0, "cap_change_24h": 0}
+
+# ── Análisis técnico de una moneda (síncrono, para executor) ──────────────────
+def _do_full_analysis(coin_id, price_info):
+    import time
+    price = price_info.get(CURRENCY, 0)
+    chg24 = price_info.get(f"{CURRENCY}_24h_change", 0) or 0
+    chg7  = price_info.get(f"{CURRENCY}_7d_change",  0) or 0
+
+    hist = _fetch_history(coin_id, 30)
+    sc_d, reas_d, rsi_d, ema7_d, ema14_d, macd_d, bb_d, vs7_d, vs14_d = \
+        score_prices(hist, price, chg24, chg7)
+    conf_d = calc_conf(sc_d)
+    target = round(price * (1 + max(0.05, abs(vs7_d)/100 + 0.03)), 8)
+    sl     = round(price * (1 - max(0.04, abs(vs14_d)/100 + 0.02)), 8)
+
+    time.sleep(0.5)
+
+    ohlc = _fetch_ohlc(coin_id, 2)
+    sc_4h, reas_4h, conf_4h, sig_4h = 0, [], 50, "⚪ MANTENER"
+    if ohlc and len(ohlc) >= 8:
+        closes = [c[4] for c in ohlc]
+        sc_4h, reas_4h, *_ = score_prices(closes[:-1], closes[-1], chg24, 0)
+        conf_4h = calc_conf(sc_4h)
+        sig_4h  = signal_label(sc_4h)
+        reas_4h = reas_4h[:2]
+
+    return {
+        "price":    price,  "chg24": chg24, "chg7": chg7,
+        "signal":   signal_label(sc_d), "confidence": conf_d, "score": sc_d,
+        "rsi":      rsi_d,  "ema7": ema7_d, "ema14": ema14_d,
+        "bb_pos":   bb_d,   "target": target, "stop_loss": sl,
+        "reasons":  reas_d,
+        "signal_4h": sig_4h, "confidence_4h": conf_4h, "score_4h": sc_4h,
+        "reasons_4h": reas_4h,
+    }
+
+def _do_hunter_analysis(coin_id, price_info):
+    """
+    Análisis simplificado para el Market Hunter.
+    Solo necesitamos RSI y score — sin OHLC para no saturar la API.
+    """
+    import time
+    price = price_info.get(CURRENCY, 0)
+    chg24 = price_info.get(f"{CURRENCY}_24h_change", 0) or 0
+    chg7  = price_info.get(f"{CURRENCY}_7d_change",  0) or 0
+
+    hist = _fetch_history(coin_id, 30)
+    if not hist:
+        return None
+
+    sc, reas, rsi, ema7, ema14, macd_v, bb_pos, vs7, vs14 = \
+        score_prices(hist, price, chg24, chg7)
+    conf = calc_conf(sc)
+    target = round(price * (1 + max(0.05, abs(vs7)/100 + 0.03)), 8)
+    sl     = round(price * (1 - max(0.04, abs(vs14)/100 + 0.02)), 8)
+
+    time.sleep(0.8)   # pausa más larga para no saturar en el scan masivo
+
+    return {
+        "price": price, "chg24": chg24, "chg7": chg7,
+        "score": sc, "rsi": rsi, "confidence": conf,
+        "signal": signal_label(sc),
+        "target": target, "stop_loss": sl,
+        "reasons": reas,
+    }
 
 # ── Catálogo helpers ──────────────────────────────────────────────────────────
 def sym(coin_id):
@@ -311,56 +383,14 @@ def signal_label(score):
 def calc_conf(score):
     return min(93, 60 + abs(score) * 5)
 
-def _do_full_analysis(coin_id, price_info):
-    import time
-    price = price_info.get(CURRENCY, 0)
-    chg24 = price_info.get(f"{CURRENCY}_24h_change", 0) or 0
-    chg7  = price_info.get(f"{CURRENCY}_7d_change",  0) or 0
-
-    hist = _fetch_history(coin_id, 30)
-    sc_d, reas_d, rsi_d, ema7_d, ema14_d, macd_d, bb_d, vs7_d, vs14_d = \
-        score_prices(hist, price, chg24, chg7)
-    conf_d = calc_conf(sc_d)
-    target = round(price * (1 + max(0.05, abs(vs7_d)/100 + 0.03)), 8)
-    sl     = round(price * (1 - max(0.04, abs(vs14_d)/100 + 0.02)), 8)
-
-    time.sleep(0.5)
-
-    ohlc = _fetch_ohlc(coin_id, 2)
-    sc_4h, reas_4h, conf_4h, sig_4h = 0, [], 50, "⚪ MANTENER"
-    if ohlc and len(ohlc) >= 8:
-        closes = [c[4] for c in ohlc]
-        sc_4h, reas_4h, *_ = score_prices(closes[:-1], closes[-1], chg24, 0)
-        conf_4h = calc_conf(sc_4h)
-        sig_4h  = signal_label(sc_4h)
-        reas_4h = reas_4h[:2]
-
-    return {
-        "price":  price,  "chg24": chg24, "chg7": chg7,
-        "signal": signal_label(sc_d), "confidence": conf_d, "score": sc_d,
-        "rsi":    rsi_d,  "ema7":  ema7_d, "ema14": ema14_d,
-        "bb_pos": bb_d,   "target": target, "stop_loss": sl,
-        "reasons": reas_d,
-        "signal_4h": sig_4h, "confidence_4h": conf_4h, "score_4h": sc_4h,
-        "reasons_4h": reas_4h,
-    }
-
-# ── Trailing Stop dinámico ────────────────────────────────────────────────────
 def calc_trailing_stop(avg_buy, current_price):
-    """
-    Si la posición tiene beneficio > TRAILING_MIN_PROFIT%,
-    devuelve un stop-loss dinámico que protege el capital invertido (break-even + margen).
-    """
     pnl_pct = ((current_price / avg_buy) - 1) * 100 if avg_buy else 0
     if pnl_pct < TRAILING_MIN_PROFIT:
         return None, pnl_pct
-    # Stop en break-even + 1% de margen
-    trailing_sl = round(avg_buy * 1.01, 8)
-    return trailing_sl, pnl_pct
+    return round(avg_buy * 1.01, 8), pnl_pct
 
 # ── Formateo ──────────────────────────────────────────────────────────────────
 def fp(p):
-    """Formatea precio en euros."""
     if not p:     return f"0{CURRENCY_SYM}"
     if p >= 1000: return f"{p:,.2f}{CURRENCY_SYM}"
     if p >= 1:    return f"{p:.4f}{CURRENCY_SYM}"
@@ -368,7 +398,6 @@ def fp(p):
     return f"{p:.8f}{CURRENCY_SYM}"
 
 def fv(v):
-    """Formatea valor en euros (millones/miles)."""
     if v >= 1e9:  return f"{v/1e9:.2f}B{CURRENCY_SYM}"
     if v >= 1e6:  return f"{v/1e6:.1f}M{CURRENCY_SYM}"
     if v >= 1e3:  return f"{v/1e3:.1f}K{CURRENCY_SYM}"
@@ -377,7 +406,7 @@ def fv(v):
 def pc(v):
     return f"{'🟢 +' if v >= 0 else '🔴 '}{v:.2f}%"
 
-# ── Mensajes de análisis ──────────────────────────────────────────────────────
+# ── Mensaje de análisis completo ──────────────────────────────────────────────
 def build_analysis_msg(coin_id, a, holding=None):
     price = a["price"]
     lines = [
@@ -402,7 +431,6 @@ def build_analysis_msg(coin_id, a, holding=None):
     ]
     for r in a["reasons_4h"]:
         lines.append(f"  · {r}")
-
     if holding:
         units, avg = holding["units"], holding["avg_buy"]
         cur = price * units
@@ -418,262 +446,385 @@ def build_analysis_msg(coin_id, a, holding=None):
             f"└ {'💰' if prf>=0 else '📉'} P&L: {fp(prf)} ({pnl:+.2f}%)",
         ]
         if trailing_sl:
-            lines.append(f"  🔒 Trailing stop activo: {fp(trailing_sl)} (break-even +1%)")
-
+            lines.append(f"  🔒 Trailing stop: {fp(trailing_sl)} (break-even +1%)")
     lines.append(f"\n_🕐 {datetime.now().strftime('%d/%m %H:%M')}_")
     return "\n".join(lines)
 
+def build_hunter_alert(coin_id, a, now_str):
+    """Mensaje de alerta cuando el Market Hunter detecta una oportunidad."""
+    price = a["price"]
+    lines = [
+        f"🎯 *OPORTUNIDAD DE ENTRADA DETECTADA*",
+        f"",
+        f"*{sym(coin_id)} — {coin_name(coin_id)}*",
+        f"💰 Precio: *{fp(price)}*",
+        f"📉 Caída 24h: {pc(a['chg24'])}",
+        f"📅 Cambio 7d: {pc(a['chg7'])}",
+        f"",
+        f"*Indicadores técnicos:*",
+        f"  RSI: `{a['rsi']}` — Sobreventa confirmada",
+        f"  Score: `{a['score']}` / 10+ — Señal fuerte",
+        f"  Confianza: `{a['confidence']}%`",
+        f"  Señal: {a['signal']}",
+        f"",
+        f"*Razones:*",
+    ]
+    for r in a["reasons"][:5]:
+        lines.append(f"  · {r}")
+    lines += [
+        f"",
+        f"*Niveles sugeridos:*",
+        f"  🎯 Objetivo: `{fp(a['target'])}` (+{((a['target']/price-1)*100):.1f}%)" if price else "",
+        f"  🛑 Stop-loss: `{fp(a['stop_loss'])}` (-{((1-a['stop_loss']/price)*100):.1f}%)" if price else "",
+        f"",
+        f"_⚠️ Solo informativo. Haz tu propio análisis antes de invertir._",
+        f"_Market Hunter — {now_str}_",
+    ]
+    return "\n".join(l for l in lines if l is not None)
+
 # ══════════════════════════════════════════════════════════════════════════════
-# MONITOR AUTOMÁTICO CADA 4H
+# MONITOR DUAL CADA 4H
 # ══════════════════════════════════════════════════════════════════════════════
 async def monitor_loop(app):
     await asyncio.sleep(30)
-    log.info("Monitor %dh iniciado", MONITOR_HOURS)
+    log.info("Monitor dual %dh iniciado", MONITOR_HOURS)
     while True:
         try:
             await do_monitor(app.bot)
         except Exception as e:
-            log.error("Error en monitor: %s", e)
+            log.error("Error crítico en monitor: %s", e)
         log.info("Próximo monitor en %dh", MONITOR_HOURS)
         await asyncio.sleep(MONITOR_HOURS * 3600)
 
 async def do_monitor(bot):
-    portfolio = state["portfolio"]
-    if not portfolio:
-        log.info("Monitor: cartera vacía")
-        return
-    if not CHAT_ID:
-        log.warning("Monitor: CHAT_ID no configurado")
-        return
-
     now_str = datetime.now().strftime("%d/%m %H:%M")
-    log.info("Monitor iniciando — %d activos", len(portfolio))
     state["last_monitor"] = now_str
+    log.info("Monitor dual iniciando — %s", now_str)
 
-    # Obtener precios y datos globales en paralelo
-    prices_data = await run(_fetch_prices, list(portfolio.keys()))
-    global_data = await run(_fetch_global)
+    portfolio   = state["portfolio"]
+    alerts_a    = []   # alertas de Fase A (cartera)
+    pnl_list    = []   # para el reporte final
+    gangas      = []   # oportunidades encontradas en Fase B
 
-    alerts    = []   # lista de mensajes de alerta a enviar
-    pnl_list  = []   # para reporte: [(coin_id, pnl_pct, price, cur_value)]
+    # ══════════════════════════════════════════════════════════════════════════
+    # FASE A — Gestión de Cartera
+    # ══════════════════════════════════════════════════════════════════════════
+    if portfolio:
+        log.info("Fase A: analizando %d activos de cartera", len(portfolio))
 
-    for coin_id, pos in portfolio.items():
-        info = prices_data.get(coin_id)
-        if not info:
-            log.warning("Monitor: sin precio para %s", coin_id)
-            continue
+        prices_data = await run(_fetch_prices, list(portfolio.keys()))
+        global_data = await run(_fetch_global)
 
-        price = info.get(CURRENCY, 0)
-        chg24 = info.get(f"{CURRENCY}_24h_change", 0) or 0
-        if not price:
-            continue
+        for coin_id, pos in portfolio.items():
+            try:
+                info = prices_data.get(coin_id)
+                if not info:
+                    log.warning("Fase A: sin precio para %s", coin_id)
+                    continue
 
-        units, avg = pos["units"], pos["avg_buy"]
-        pnl_pct   = ((price / avg) - 1) * 100 if avg else 0
-        cur_value  = price * units
-        inv_value  = avg * units
-        profit_eur = cur_value - inv_value
+                price = info.get(CURRENCY, 0)
+                chg24 = info.get(f"{CURRENCY}_24h_change", 0) or 0
+                if not price:
+                    continue
 
-        pnl_list.append((coin_id, pnl_pct, price, cur_value))
+                units, avg = pos["units"], pos["avg_buy"]
+                pnl_pct    = ((price / avg) - 1) * 100 if avg else 0
+                cur_value  = price * units
+                inv_value  = avg * units
+                profit_eur = cur_value - inv_value
 
-        # ── Detector de volatilidad ───────────────────────────────────────────
-        prev_price = state["prev_prices"].get(coin_id)
-        vol_pct = 0.0
-        if prev_price and prev_price > 0:
-            vol_pct = abs((price - prev_price) / prev_price * 100)
-            if vol_pct >= VOLATILITY_PCT:
-                direction = "subida" if price > prev_price else "caída"
-                alerts.append(
-                    f"⚡ *ALTA VOLATILIDAD — {sym(coin_id)}*\n"
-                    f"_{direction.capitalize()} del {vol_pct:.1f}% en las últimas {MONITOR_HOURS}h_\n\n"
-                    f"  Precio: *{fp(price)}*   24h: {pc(chg24)}\n"
-                    f"  Tu P&L: {fp(profit_eur)} ({pnl_pct:+.2f}%)\n"
-                    f"_Monitor {now_str}_"
-                )
+                pnl_list.append((coin_id, pnl_pct, price, cur_value))
 
-        # Guardar precio actual para el próximo ciclo
-        state["prev_prices"][coin_id] = price
+                # ── Detector de volatilidad ───────────────────────────────────
+                prev_price = state["prev_prices"].get(coin_id)
+                if prev_price and prev_price > 0:
+                    vol_pct = abs((price - prev_price) / prev_price * 100)
+                    if vol_pct >= VOLATILITY_PCT:
+                        direction = "subida" if price > prev_price else "caída"
+                        alerts_a.append(
+                            f"⚡ *ALTA VOLATILIDAD — {sym(coin_id)}*\n"
+                            f"_{direction.capitalize()} del {vol_pct:.1f}% en las últimas {MONITOR_HOURS}h_\n\n"
+                            f"  Precio: *{fp(price)}*   24h: {pc(chg24)}\n"
+                            f"  Tu P&L: {fp(profit_eur)} ({pnl_pct:+.2f}%)\n"
+                            f"_Monitor {now_str}_"
+                        )
 
-        # ── Análisis técnico completo ─────────────────────────────────────────
-        a = await run(_do_full_analysis, coin_id, info)
+                state["prev_prices"][coin_id] = price
 
-        trailing_sl, _ = calc_trailing_stop(avg, price)
+                # ── Análisis técnico completo ─────────────────────────────────
+                a = await run(_do_full_analysis, coin_id, info)
+                trailing_sl, _ = calc_trailing_stop(avg, price)
+                drop_from_avg  = ((avg - price) / avg * 100) if avg else 0
 
-        # ── Lógica de alertas proactivas ──────────────────────────────────────
+                # 1. Oportunidad DCA
+                if drop_from_avg >= DCA_DROP_PCT and a["rsi"] < 35:
+                    alerts_a.append(
+                        f"💡 *OPORTUNIDAD DCA — {sym(coin_id)}*\n"
+                        f"_Caída del {drop_from_avg:.1f}% sobre precio de compra + RSI en sobreventa_\n\n"
+                        f"  Precio actual: *{fp(price)}*\n"
+                        f"  Compra media: {fp(avg)}\n"
+                        f"  RSI: `{a['rsi']}` — Zona de acumulación\n"
+                        f"  P&L actual: {fp(profit_eur)} ({pnl_pct:+.2f}%)\n\n"
+                        f"  Promediar bajaría tu coste medio y mejoraría el break-even.\n"
+                        f"  ⚠️ Solo si tienes convicción en el activo.\n"
+                        f"_Monitor {now_str}_"
+                    )
+                    continue
 
-        # 1. Oportunidad DCA: caída >= 10% sobre avg_buy y RSI < 35
-        drop_from_avg = ((avg - price) / avg * 100) if avg else 0
-        if drop_from_avg >= DCA_DROP_PCT and a["rsi"] < 35:
-            alerts.append(
-                f"💡 *OPORTUNIDAD DCA — {sym(coin_id)}*\n"
-                f"_Caída del {drop_from_avg:.1f}% sobre tu precio de compra con RSI en sobreventa_\n\n"
-                f"  Precio actual: *{fp(price)}*\n"
-                f"  Tu compra media: {fp(avg)}\n"
-                f"  RSI: `{a['rsi']}` — Zona de acumulación\n"
-                f"  P&L actual: {fp(profit_eur)} ({pnl_pct:+.2f}%)\n\n"
-                f"  Promediar te bajaría el coste medio y mejoraría el punto de equilibrio.\n"
-                f"  ⚠️ Solo si tienes convicción en el activo.\n"
-                f"_Monitor {now_str}_"
-            )
-            continue   # no generar alerta de venta si hay señal DCA
+                # 2. Trailing stop amenazado
+                if trailing_sl and price <= trailing_sl * 1.01:
+                    alerts_a.append(
+                        f"🔒 *TRAILING STOP — {sym(coin_id)}*\n"
+                        f"_El precio se acerca al stop dinámico de break-even_\n\n"
+                        f"  Precio actual: *{fp(price)}*\n"
+                        f"  Trailing stop: {fp(trailing_sl)}\n"
+                        f"  P&L actual: {fp(profit_eur)} ({pnl_pct:+.2f}%)\n"
+                        f"  Considera vender para proteger tus ganancias.\n"
+                        f"_Monitor {now_str}_"
+                    )
+                    continue
 
-        # 2. Trailing stop activado y precio cayendo por debajo
-        if trailing_sl and price <= trailing_sl * 1.01:
-            alerts.append(
-                f"🔒 *TRAILING STOP — {sym(coin_id)}*\n"
-                f"_El precio se acerca al stop dinámico de break-even_\n\n"
-                f"  Precio actual: *{fp(price)}*\n"
-                f"  Trailing stop: {fp(trailing_sl)}\n"
-                f"  P&L actual: {fp(profit_eur)} ({pnl_pct:+.2f}%)\n"
-                f"  Considera vender para proteger tus ganancias.\n"
-                f"_Monitor {now_str}_"
-            )
-            continue
+                # 3. Señal técnica fuerte de venta
+                if a["score"] <= -3 and a["confidence"] >= SELL_CONF_MIN:
+                    alerts_a.append(
+                        f"🚨 *ALERTA VENTA — {sym(coin_id)}*\n"
+                        f"_Señales técnicas apuntan a presión bajista_\n\n"
+                        f"  Precio: *{fp(price)}*   24h: {pc(chg24)}\n"
+                        f"  Señal diaria: {a['signal']} ({a['confidence']}%)\n"
+                        f"  Señal 4h: {a['signal_4h']} ({a['confidence_4h']}%)\n"
+                        f"  RSI: `{a['rsi']}`\n\n"
+                        f"  Razones:\n"
+                        + "\n".join(f"  · {r}" for r in a["reasons"][:3])
+                        + f"\n\n  Tu posición: {fp(profit_eur)} ({pnl_pct:+.2f}%)\n"
+                        f"_Monitor {now_str}_"
+                    )
 
-        # 3. Señal técnica fuerte de venta
-        if a["score"] <= -3 and a["confidence"] >= SELL_CONF_MIN:
-            alerts.append(
-                f"🚨 *ALERTA VENTA — {sym(coin_id)}*\n"
-                f"_Señales técnicas apuntan a presión bajista_\n\n"
-                f"  Precio: *{fp(price)}*   24h: {pc(chg24)}\n"
-                f"  Señal diaria: {a['signal']} ({a['confidence']}%)\n"
-                f"  Señal 4h: {a['signal_4h']} ({a['confidence_4h']}%)\n"
-                f"  RSI: `{a['rsi']}`\n\n"
-                f"  Razones:\n"
-                + "\n".join(f"  · {r}" for r in a["reasons"][:3]) +
-                f"\n\n  Tu posición: {fp(profit_eur)} ({pnl_pct:+.2f}%)\n"
-                f"_Monitor {now_str}_"
-            )
+                # 4. Bajista en diario y 4h simultáneo
+                elif a["score"] <= -2 and a["score_4h"] <= -2 and a["confidence"] >= SELL_CONF_MIN:
+                    alerts_a.append(
+                        f"🚨 *SEÑAL BAJISTA CONFIRMADA — {sym(coin_id)}*\n"
+                        f"_Tendencia bajista en timeframe diario y 4h_\n\n"
+                        f"  Precio: *{fp(price)}*   24h: {pc(chg24)}\n"
+                        f"  Diario: {a['signal']} | 4H: {a['signal_4h']}\n"
+                        f"  P&L actual: {fp(profit_eur)} ({pnl_pct:+.2f}%)\n"
+                        f"_Monitor {now_str}_"
+                    )
 
-        # 4. Señal bajista diaria y 4h confirmada (aunque no llegue a -3)
-        elif a["score"] <= -2 and a["score_4h"] <= -2 and a["confidence"] >= SELL_CONF_MIN:
-            alerts.append(
-                f"🚨 *SEÑAL BAJISTA CONFIRMADA — {sym(coin_id)}*\n"
-                f"_Tendencia bajista en timeframe diario y 4h simultáneamente_\n\n"
-                f"  Precio: *{fp(price)}*   24h: {pc(chg24)}\n"
-                f"  Diario: {a['signal']} | 4H: {a['signal_4h']}\n"
-                f"  P&L actual: {fp(profit_eur)} ({pnl_pct:+.2f}%)\n"
-                f"_Monitor {now_str}_"
-            )
+                # 5. RSI sobrecompra + beneficio significativo
+                elif a["rsi"] >= 75 and pnl_pct >= 10:
+                    alerts_a.append(
+                        f"⚠️ *TOMA DE GANANCIAS — {sym(coin_id)}*\n"
+                        f"_RSI en sobrecompra extrema con beneficio acumulado_\n\n"
+                        f"  Precio: *{fp(price)}*\n"
+                        f"  RSI: `{a['rsi']}` — Sobrecompra\n"
+                        f"  P&L: {fp(profit_eur)} ({pnl_pct:+.2f}%)\n"
+                        f"  Considera tomar parcialmente los beneficios.\n"
+                        f"_Monitor {now_str}_"
+                    )
 
-        # 5. RSI sobrecompra extrema + beneficio significativo
-        elif a["rsi"] >= 75 and pnl_pct >= 10:
-            alerts.append(
-                f"⚠️ *TOMA DE GANANCIAS — {sym(coin_id)}*\n"
-                f"_RSI en sobrecompra extrema con beneficio acumulado importante_\n\n"
-                f"  Precio: *{fp(price)}*\n"
-                f"  RSI: `{a['rsi']}` — Sobrecompra\n"
-                f"  P&L: {fp(profit_eur)} ({pnl_pct:+.2f}%)\n"
-                f"  Considera tomar parcialmente los beneficios.\n"
-                f"_Monitor {now_str}_"
-            )
+                # 6. Objetivo de beneficio alcanzado
+                elif pnl_pct >= PROFIT_ALERT and a["score"] <= 0:
+                    alerts_a.append(
+                        f"💰 *OBJETIVO BENEFICIO — {sym(coin_id)}*\n"
+                        f"_Has superado +{PROFIT_ALERT:.0f}% con señal neutral o bajista_\n\n"
+                        f"  Precio: *{fp(price)}*\n"
+                        f"  P&L: {fp(profit_eur)} ({pnl_pct:+.2f}%)\n"
+                        f"  Señal: {a['signal']}\n"
+                        f"  Considera asegurar parte de las ganancias.\n"
+                        f"_Monitor {now_str}_"
+                    )
 
-        # 6. Objetivo de beneficio alcanzado + señal no alcista
-        elif pnl_pct >= PROFIT_ALERT and a["score"] <= 0:
-            alerts.append(
-                f"💰 *OBJETIVO DE BENEFICIO — {sym(coin_id)}*\n"
-                f"_Has alcanzado +{PROFIT_ALERT:.0f}% con señal neutral o bajista_\n\n"
-                f"  Precio: *{fp(price)}*\n"
-                f"  P&L: {fp(profit_eur)} ({pnl_pct:+.2f}%)\n"
-                f"  Señal: {a['signal']}\n"
-                f"  Considera asegurar parte de las ganancias.\n"
-                f"_Monitor {now_str}_"
-            )
+                # 7. Stop-loss clásico cercano
+                elif price <= a["stop_loss"] * 1.02:
+                    alerts_a.append(
+                        f"🛑 *STOP-LOSS CERCANO — {sym(coin_id)}*\n"
+                        f"_El precio se acerca al nivel de stop-loss sugerido_\n\n"
+                        f"  Precio actual: *{fp(price)}*\n"
+                        f"  Stop-loss sugerido: {fp(a['stop_loss'])}\n"
+                        f"  P&L: {fp(profit_eur)} ({pnl_pct:+.2f}%)\n"
+                        f"_Monitor {now_str}_"
+                    )
 
-        # 7. Stop-loss clásico: precio cerca del stop sugerido por el análisis
-        elif price <= a["stop_loss"] * 1.02:
-            alerts.append(
-                f"🛑 *STOP-LOSS CERCANO — {sym(coin_id)}*\n"
-                f"_El precio se acerca al nivel de stop-loss sugerido_\n\n"
-                f"  Precio actual: *{fp(price)}*\n"
-                f"  Stop-loss sugerido: {fp(a['stop_loss'])}\n"
-                f"  P&L: {fp(profit_eur)} ({pnl_pct:+.2f}%)\n"
-                f"_Monitor {now_str}_"
-            )
+                await asyncio.sleep(0.8)
 
-        await asyncio.sleep(0.8)
+            except Exception as e:
+                log.error("Fase A error en %s: %s", coin_id, e)
+                continue
 
-    # Guardar precios del ciclo actual para el siguiente
-    save_state()
+        # Guardar precios del ciclo
+        save_state()
 
-    # ── Enviar alertas ────────────────────────────────────────────────────────
-    for alert_text in alerts:
+    else:
+        log.info("Fase A: cartera vacía, saltando")
+        global_data = await run(_fetch_global)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # FASE B — Market Hunter (siempre se ejecuta, tenga o no cartera)
+    # ══════════════════════════════════════════════════════════════════════════
+    log.info("Fase B: Market Hunter iniciando scan del top 100")
+
+    try:
+        markets = await run(_fetch_top_markets)
+    except Exception as e:
+        log.error("Fase B: error obteniendo mercados: %s", e)
+        markets = []
+
+    if markets:
+        # Pre-filtro rápido: solo candidatos con caída > HUNTER_DROP_24H%
+        # Esto evita hacer _fetch_history de 100 monedas innecesariamente
+        candidates = []
+        for c in markets:
+            cid   = c.get("id", "")
+            chg24 = c.get("price_change_percentage_24h", 0) or 0
+            price = c.get("current_price", 0) or 0
+            if not cid or not price:
+                continue
+            # Actualizar catálogo con datos frescos
+            if cid not in CATALOGUE:
+                CATALOGUE[cid] = {
+                    "symbol": c.get("symbol", "").upper(),
+                    "name":   c.get("name", ""),
+                }
+            # Solo candidatos con caída suficiente y que NO estén en cartera
+            if chg24 <= -HUNTER_DROP_24H and cid not in portfolio:
+                candidates.append(c)
+
+        log.info("Fase B: %d candidatos pre-filtrados de %d monedas", len(candidates), len(markets))
+
+        for c in candidates:
+            cid   = c.get("id", "")
+            chg24 = c.get("price_change_percentage_24h", 0) or 0
+            chg7  = c.get("price_change_percentage_7d_in_currency", 0) or 0
+            price = c.get("current_price", 0) or 0
+
+            # Construir price_info compatible con _do_hunter_analysis
+            price_info = {
+                CURRENCY:                    price,
+                f"{CURRENCY}_24h_change":    chg24,
+                f"{CURRENCY}_7d_change":     chg7,
+                f"{CURRENCY}_24h_vol":       c.get("total_volume", 0) or 0,
+                f"{CURRENCY}_market_cap":    c.get("market_cap", 0) or 0,
+            }
+
+            try:
+                # Análisis técnico completo (incluye fetch_history)
+                a = await run(_do_hunter_analysis, cid, price_info)
+                if a is None:
+                    continue
+
+                # ── FILTRO FRANCOTIRADOR (las 3 condiciones deben cumplirse) ──
+                if (a["rsi"] < HUNTER_RSI_MAX          # RSI en sobreventa confirmada
+                        and a["score"] >= HUNTER_SCORE_MIN):  # Score técnico fuerte
+                    log.info("Fase B: GANGA detectada — %s (RSI=%s, score=%s)",
+                             sym(cid), a["rsi"], a["score"])
+                    gangas.append((cid, a))
+
+                # Pausa entre llamadas para respetar el rate limit de CoinGecko
+                await asyncio.sleep(1.5)
+
+            except Exception as e:
+                log.warning("Fase B: error analizando %s: %s", cid, e)
+                continue
+    else:
+        log.warning("Fase B: no se pudieron obtener datos de mercado")
+
+    # ── Enviar alertas Fase A ─────────────────────────────────────────────────
+    if not CHAT_ID:
+        log.warning("CHAT_ID no configurado — no se pueden enviar mensajes")
+        return
+
+    for alert_text in alerts_a:
         try:
             await bot.send_message(chat_id=CHAT_ID, text=alert_text, parse_mode="Markdown")
             await asyncio.sleep(0.5)
         except Exception as e:
-            log.error("Error enviando alerta: %s", e)
+            log.error("Error enviando alerta Fase A: %s", e)
 
-    # ── Reporte detallado (siempre, haya o no alertas) ────────────────────────
-    await _send_monitor_report(bot, pnl_list, global_data, len(alerts), now_str)
+    # ── Enviar oportunidades Fase B ───────────────────────────────────────────
+    for cid, a in gangas:
+        try:
+            await bot.send_message(
+                chat_id    = CHAT_ID,
+                text       = build_hunter_alert(cid, a, now_str),
+                parse_mode = "Markdown",
+            )
+            await asyncio.sleep(0.5)
+        except Exception as e:
+            log.error("Error enviando alerta Fase B %s: %s", cid, e)
 
-async def _send_monitor_report(bot, pnl_list, global_data, n_alerts, now_str):
-    """Reporte de estado de cartera con top ganador, top perdedor y mercado global."""
-    if not pnl_list:
-        return
+    # ── Reporte final ─────────────────────────────────────────────────────────
+    await _send_monitor_report(
+        bot, pnl_list, global_data,
+        n_alerts_a = len(alerts_a),
+        n_gangas   = len(gangas),
+        now_str    = now_str,
+    )
 
+async def _send_monitor_report(bot, pnl_list, global_data,
+                                n_alerts_a, n_gangas, now_str):
+    """Reporte consolidado al final del ciclo: cartera + mercado global + gangas."""
     portfolio = state["portfolio"]
 
-    # Calcular totales
+    # Totales de cartera
     total_inv = total_cur = 0
     for cid, pnl_pct, price, cur_val in pnl_list:
-        pos = portfolio.get(cid, {})
-        inv = pos.get("avg_buy", 0) * pos.get("units", 0)
+        pos      = portfolio.get(cid, {})
+        inv      = pos.get("avg_buy", 0) * pos.get("units", 0)
         total_inv += inv
         total_cur += cur_val
 
     total_pnl     = total_cur - total_inv
     total_pnl_pct = (total_pnl / total_inv * 100) if total_inv else 0
 
-    # Top ganador y top perdedor
-    pnl_sorted   = sorted(pnl_list, key=lambda x: x[1], reverse=True)
-    top_winner   = pnl_sorted[0]   if pnl_sorted else None
-    top_loser    = pnl_sorted[-1]  if len(pnl_sorted) > 1 else None
+    # Top ganador y perdedor
+    pnl_sorted = sorted(pnl_list, key=lambda x: x[1], reverse=True)
+    top_winner = pnl_sorted[0]  if pnl_sorted           else None
+    top_loser  = pnl_sorted[-1] if len(pnl_sorted) > 1  else None
 
-    # Dominancia BTC
+    # Datos globales
     btc_dom   = global_data.get("btc_dominance", 0)
     total_cap = global_data.get("total_cap_eur", 0)
     cap_chg   = global_data.get("cap_change_24h", 0)
 
-    # Sentimiento de mercado basado en dominancia
     if btc_dom > 60:
-        market_mood = "🔵 Dominancia BTC alta — mercado en modo defensivo/Bitcoin"
+        market_mood = "🔵 Dominancia BTC alta — mercado defensivo/Bitcoin"
     elif btc_dom > 50:
         market_mood = "🟡 Dominancia BTC moderada — equilibrio BTC/altcoins"
     else:
-        market_mood = "🟢 Dominancia BTC baja — temporada de altcoins posible"
+        market_mood = "🟢 Dominancia BTC baja — posible temporada de altcoins"
 
-    lines = [
-        f"📋 *INFORME DE CARTERA — {now_str}*",
-        "",
-        "━━━━━━━━━━━━━━━━━━━━━━━━",
-        f"{'🟢' if total_pnl >= 0 else '🔴'} *Balance Total*",
-        f"  Invertido: {fp(total_inv)}",
-        f"  Valor actual: {fp(total_cur)}",
-        f"  P&L: {fp(total_pnl)} ({total_pnl_pct:+.2f}%)",
-        "",
-    ]
+    lines = [f"📋 *INFORME MONITOR — {now_str}*", ""]
 
-    if top_winner:
-        pos_w = portfolio.get(top_winner[0], {})
-        inv_w = pos_w.get("avg_buy", 0) * pos_w.get("units", 0)
-        pnl_w = top_winner[3] - inv_w
+    # ── Sección cartera ───────────────────────────────────────────────────────
+    if pnl_list:
         lines += [
-            f"🏆 *Top Ganador:* {sym(top_winner[0])} ({coin_name(top_winner[0])})",
-            f"  {fp(top_winner[2])} · P&L: {fp(pnl_w)} ({top_winner[1]:+.2f}%)",
+            "━━━━━━━━━━━━━━━━━━━━━━━━",
+            f"{'🟢' if total_pnl >= 0 else '🔴'} *Balance de Cartera*",
+            f"  Invertido: {fp(total_inv)}",
+            f"  Valor actual: {fp(total_cur)}",
+            f"  P&L: {fp(total_pnl)} ({total_pnl_pct:+.2f}%)",
+            "",
         ]
+        if top_winner:
+            pos_w = portfolio.get(top_winner[0], {})
+            inv_w = pos_w.get("avg_buy", 0) * pos_w.get("units", 0)
+            pnl_w = top_winner[3] - inv_w
+            lines += [
+                f"🏆 *Top Ganador:* {sym(top_winner[0])} ({coin_name(top_winner[0])})",
+                f"  {fp(top_winner[2])} · P&L: {fp(pnl_w)} ({top_winner[1]:+.2f}%)",
+            ]
+        if top_loser and top_loser[0] != (top_winner[0] if top_winner else ""):
+            pos_l = portfolio.get(top_loser[0], {})
+            inv_l = pos_l.get("avg_buy", 0) * pos_l.get("units", 0)
+            pnl_l = top_loser[3] - inv_l
+            lines += [
+                f"📉 *Top Perdedor:* {sym(top_loser[0])} ({coin_name(top_loser[0])})",
+                f"  {fp(top_loser[2])} · P&L: {fp(pnl_l)} ({top_loser[1]:+.2f}%)",
+            ]
+        lines.append("")
 
-    if top_loser and top_loser[0] != top_winner[0]:
-        pos_l = portfolio.get(top_loser[0], {})
-        inv_l = pos_l.get("avg_buy", 0) * pos_l.get("units", 0)
-        pnl_l = top_loser[3] - inv_l
-        lines += [
-            f"📉 *Top Perdedor:* {sym(top_loser[0])} ({coin_name(top_loser[0])})",
-            f"  {fp(top_loser[2])} · P&L: {fp(pnl_l)} ({top_loser[1]:+.2f}%)",
-        ]
-
+    # ── Sección mercado global ────────────────────────────────────────────────
     lines += [
-        "",
         "━━━━━━━━━━━━━━━━━━━━━━━━",
         "🌍 *Estado Global del Mercado*",
         f"  Dominancia BTC: *{btc_dom}%*",
@@ -681,16 +832,26 @@ async def _send_monitor_report(bot, pnl_list, global_data, n_alerts, now_str):
         f"  Variación 24h: {pc(cap_chg)}",
         f"  {market_mood}",
         "",
-        "━━━━━━━━━━━━━━━━━━━━━━━━",
     ]
 
-    if n_alerts == 0:
+    # ── Sección resumen de alertas ────────────────────────────────────────────
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━")
+
+    if n_alerts_a == 0 and n_gangas == 0:
         lines += [
             "✅ *Sin señales de acción detectadas*",
-            "Tu cartera está estable. No hay movimientos urgentes recomendados.",
+            "Cartera estable. No hay movimientos urgentes recomendados.",
         ]
     else:
-        lines.append(f"⚠️ Se han enviado *{n_alerts} alerta{'s' if n_alerts>1 else ''}* en este ciclo.")
+        if n_alerts_a > 0:
+            lines.append(
+                f"⚠️ *{n_alerts_a} alerta{'s' if n_alerts_a>1 else ''} de cartera* enviada{'s' if n_alerts_a>1 else ''}."
+            )
+        if n_gangas > 0:
+            lines.append(
+                f"🎯 *{n_gangas} ganga{'s' if n_gangas>1 else ''} detectada{'s' if n_gangas>1 else ''} en el mercado.* "
+                f"Revisa las alertas de OPORTUNIDAD DE ENTRADA."
+            )
 
     lines.append(f"\n_Próximo análisis en {MONITOR_HOURS}h_")
 
@@ -701,13 +862,13 @@ async def _send_monitor_report(bot, pnl_list, global_data, n_alerts, now_str):
             parse_mode = "Markdown",
         )
     except Exception as e:
-        log.error("Error enviando reporte: %s", e)
+        log.error("Error enviando reporte final: %s", e)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # COMANDOS
 # ══════════════════════════════════════════════════════════════════════════════
 HELP = (
-    "👋 *Crypto Bot Pro v14 — Comandos*\n\n"
+    "👋 *Crypto Bot Pro v15 — Comandos*\n\n"
     "📦 *CARTERA*\n"
     "  /compra BTC 0\\.5 — Registrar compra\n"
     "  /compra BTC 0\\.5 52000 — Con precio manual en €\n"
@@ -720,17 +881,17 @@ HELP = (
     "  /analizar — Analizar toda tu cartera\n\n"
     "🔍 *MERCADO*\n"
     "  /mercado — Top 100 oportunidades en €\n\n"
-    "🔔 *MONITOR 4H*\n"
+    "🔔 *MONITOR DUAL 4H*\n"
     "  /monitor — Estado del monitor automático\n"
     "  /forzarmonitor — Ejecutar análisis ahora\n\n"
     "⚙️ /cancelar — Parar comando en curso\n\n"
-    "_Precios en euros · Monitor cada 4h_"
+    "_Precios en euros · Monitor dual cada 4h_\n"
+    "_Fase A: Cartera · Fase B: Market Hunter_"
 )
 
 async def cmd_start(u, c): await u.message.reply_text(HELP, parse_mode="MarkdownV2")
 async def cmd_ayuda(u, c): await u.message.reply_text(HELP, parse_mode="MarkdownV2")
 
-# ── Cartera ───────────────────────────────────────────────────────────────────
 async def cmd_cartera(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     p = state["portfolio"]
     if not p:
@@ -739,7 +900,7 @@ async def cmd_cartera(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg  = await update.message.reply_text("🔄 Obteniendo precios en €...")
     data = await run(_fetch_prices, list(p.keys()))
     ti = tc = 0
-    lines = [f"💼 *Tu Cartera* (en {CURRENCY_SYM})\n"]
+    lines = [f"💼 *Tu Cartera* ({CURRENCY_SYM})\n"]
     for cid, pos in p.items():
         units, avg = pos["units"], pos["avg_buy"]
         info  = data.get(cid, {})
@@ -804,7 +965,6 @@ async def cmd_compra(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         buy_price = info[coin_id].get(CURRENCY, 0)
         await msg.delete()
-
     p = state["portfolio"]
     if coin_id in p:
         ou, oa = p[coin_id]["units"], p[coin_id]["avg_buy"]
@@ -917,11 +1077,8 @@ async def cmd_buscar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"  Mkt cap: {fv(d.get(f'{CURRENCY}_market_cap', 0) or 0)}",
         parse_mode="Markdown", reply_markup=kb)
 
-# ── Analizar ──────────────────────────────────────────────────────────────────
 async def cmd_analizar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     p = state["portfolio"]
-
-    # /analizar BTC
     if ctx.args:
         coin_id = resolve_coin(ctx.args[0])
         if not coin_id:
@@ -940,8 +1097,6 @@ async def cmd_analizar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             build_analysis_msg(coin_id, a, holding=p.get(coin_id)),
             parse_mode="Markdown")
         return
-
-    # /analizar — toda la cartera
     if not p:
         await update.message.reply_text(
             "Tu cartera está vacía.\n\nUsa /compra BTC 0.5 para añadir\n"
@@ -971,7 +1126,6 @@ async def cmd_analizar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"_🕐 {datetime.now().strftime('%H:%M')}_",
         parse_mode="Markdown")
 
-# ── Mercado ───────────────────────────────────────────────────────────────────
 async def cmd_mercado(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text(
         f"🔍 *Analizando el top 100 del mercado en {CURRENCY_SYM}...*\n_~30 segundos._",
@@ -1032,33 +1186,34 @@ async def cmd_mercado(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ]
     await msg.edit_text("\n".join(lines), parse_mode="Markdown")
 
-# ── Monitor ───────────────────────────────────────────────────────────────────
 async def cmd_monitor(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     last = state.get("last_monitor") or "Todavía no ejecutado"
     await update.message.reply_text(
-        f"🔔 *Monitor automático*\n\n"
+        f"🔔 *Monitor Dual v15*\n\n"
         f"  Frecuencia: cada *{MONITOR_HOURS} horas*\n"
-        f"  Último análisis: `{last}`\n"
-        f"  Activos vigilados: `{len(state['portfolio'])}`\n"
+        f"  Último ciclo: `{last}`\n"
+        f"  Activos en cartera: `{len(state['portfolio'])}`\n"
         f"  Moneda: *{CURRENCY_SYM} (euros)*\n\n"
-        f"*Alertas activas:*\n"
-        f"  · 🚨 Señal técnica de venta (conf. ≥{SELL_CONF_MIN}%)\n"
-        f"  · 💡 Oportunidad DCA (caída ≥{DCA_DROP_PCT:.0f}% + RSI<35)\n"
+        f"*Fase A — Cartera:*\n"
+        f"  · 🚨 Señal técnica de venta (conf ≥{SELL_CONF_MIN}%)\n"
+        f"  · 💡 DCA (caída ≥{DCA_DROP_PCT:.0f}% avg\\_buy + RSI<35)\n"
         f"  · 🔒 Trailing stop break-even (beneficio ≥{TRAILING_MIN_PROFIT:.0f}%)\n"
-        f"  · ⚡ Alta volatilidad (movimiento ≥{VOLATILITY_PCT:.0f}% en 4h)\n"
+        f"  · ⚡ Volatilidad ≥{VOLATILITY_PCT:.0f}% en 4h\n"
         f"  · 💰 Objetivo beneficio ≥{PROFIT_ALERT:.0f}%\n"
-        f"  · 🛑 Precio cerca del stop-loss\n\n"
+        f"  · 🛑 Stop-loss cercano\n\n"
+        f"*Fase B — Market Hunter:*\n"
+        f"  · 🎯 Caída >10% + RSI<{HUNTER_RSI_MAX} + Score≥{HUNTER_SCORE_MIN}\n"
+        f"  · Scan top 100 por capitalización\n"
+        f"  · Solo monedas que NO tienes en cartera\n\n"
         f"Usa /forzarmonitor para ejecutar ahora.",
         parse_mode="Markdown")
 
 async def cmd_forzar_monitor(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not state["portfolio"]:
-        await update.message.reply_text(
-            "Tu cartera está vacía. Añade criptos con /compra primero.")
-        return
     await update.message.reply_text(
-        f"🔄 Ejecutando análisis de {len(state['portfolio'])} activos...\n"
-        f"_Recibirás el informe en unos segundos._",
+        f"🔄 Ejecutando monitor dual...\n"
+        f"_Fase A: {len(state['portfolio'])} activos en cartera\n"
+        f"Fase B: scan del top 100 del mercado\n"
+        f"Recibirás el informe completo en unos minutos._",
         parse_mode="Markdown")
     await do_monitor(ctx.bot)
 
@@ -1066,7 +1221,6 @@ async def cmd_cancelar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     state["cancel"] = True
     await update.message.reply_text("🛑 Cancelando en el siguiente paso...")
 
-# ── Callbacks inline ──────────────────────────────────────────────────────────
 async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -1128,7 +1282,7 @@ def main():
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, unknown_handler))
 
-    log.info("Bot v14 arrancado — monitor cada %dh — moneda: %s", MONITOR_HOURS, CURRENCY_SYM)
+    log.info("Bot v15 arrancado — monitor dual cada %dh — %s", MONITOR_HOURS, CURRENCY_SYM)
     app.run_polling(allowed_updates=["message", "callback_query"])
 
 if __name__ == "__main__":
