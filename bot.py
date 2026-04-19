@@ -1,1545 +1,765 @@
 """
-CRYPTO BOT PRO v19 — Aggressive Hunter (cuenta pequeña 45€)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-CAMBIOS v19 vs v18:
+CRYPTO BOT PRO v20.2.2 — OKX USDC Watcher
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Exchange  : OKX SPOT · cuenta Trading · tdMode='cash'
+Moneda    : USDC (no USDT)
+Capital   : ~91.94 USDC → 25 USDC por operación · máx. 3 abiertas
+Vigilancia: TAO/USDC · RENDER/USDC · FET/USDC · SOL/USDC
+Señal     : RSI < 32 + MACD girando al alza + BTC estable (no cae >1%/1h)
+Riesgo    : SL -2.5% · TP +4% · Kill Switch -5%/día
+Telegram  : Solo notificaciones · sin comandos · lenguaje llano
 
-  1. NUEVO TERRITORIO: Top 51-150 por Volumen (Capa 2)
-     · Zona de mayor volatilidad — más oportunidades de rebote
-     · Dos llamadas paginadas al endpoint /coins/markets
-
-  2. GATILLOS AGRESIVOS UNIFICADOS (ambas capas):
-     · Caída &gt;10% en 24h  O  RSI &lt;32  (Radar Fijo)
-     · Caída &gt;10% en 24h  Y  RSI &lt;32  (Escáner 51-150)
-     · Score mínimo: 3 (Radar) / 4 (Escáner)
-
-  3. MONITOR HORARIO: cada 1h (antes 4h)
-     · Más reacciones a rebotes rápidos intradía
-
-  4. MENSAJERÍA 100% HTML (heredado de v18, verificado)
-
-  5. /analizar: aviso ⚠️ SECTOR VOLÁTIL si moneda fuera del Top 50
-
-HEREDADO DE v16-v18:
-  · Cartera por Coste Real (total_invertido_eur + cantidad_tokens)
-  · Beneficio Neto = (tokens × precio) − invertido_eur
-  · Break-even awareness en alertas de venta
-  · Migración automática v15 → ... → v19
-
-MONITOR 3 FASES cada 1h:
-  Fase A — Cartera (break-even real)
-  Fase B — Radar Fijo TAO/RENDER/FET/ONDO/AKT
-  Fase C — Escáner Top 51-150 por volumen (zona volátil)
-
-Todo en EUROS (€)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+VARIABLES DE ENTORNO:
+  TELEGRAM_TOKEN, CHAT_ID
+  OKX_API_KEY, OKX_SECRET_KEY, OKX_PASSPHRASE
+  DRY_RUN=true
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
-import os, json, asyncio, logging, requests
-from datetime import datetime
+import os, json, asyncio, logging, time, math
+from datetime import datetime, timezone, date
 from functools import partial
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application, CommandHandler, MessageHandler,
-    CallbackQueryHandler, ContextTypes, filters,
-)
+from typing import Optional
 
-# ── Config ────────────────────────────────────────────────────────────────────
-TELEGRAM_TOKEN      = os.environ.get("TELEGRAM_TOKEN", "")
-CHAT_ID             = os.environ.get("CHAT_ID", "")
-PORTFOLIO_FILE      = "portfolio.json"
-GECKO               = "https://api.coingecko.com/api/v3"
-CURRENCY            = "eur"
-CURRENCY_SYM        = "€"
-MONITOR_HOURS       = 1        # ← v19: monitorización horaria (antes 4h)
-# Filtros Fase A — Cartera
-SELL_CONF_MIN       = 60
-DCA_DROP_PCT        = 10.0
-TRAILING_MIN_PROFIT = 5.0
-VOLATILITY_PCT      = 5.0
-PROFIT_ALERT        = 10.0
+import ccxt
+from telegram import Bot
 
-# ── Capa 1: Radar Fijo IA/DePIN — gatillos agresivos v19 ─────────────────────
-RADAR_DROP_24H      = 10.0   # caída mínima en 24h (subido de 8% → 10%)
-RADAR_RSI_MAX       = 32     # RSI máximo (subido de 30 → 32, más sensible)
-RADAR_SCORE_MIN     = 3      # score técnico mínimo
+# ══════════════════════════════════════════════════════════════════════════════
+# CONFIGURACIÓN
+# ══════════════════════════════════════════════════════════════════════════════
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
+CHAT_ID        = os.environ.get("CHAT_ID", "")
+OKX_API_KEY    = os.environ.get("OKX_API_KEY", "")
+OKX_SECRET     = os.environ.get("OKX_SECRET_KEY", "")
+OKX_PASSPHRASE = os.environ.get("OKX_PASSPHRASE", "")
+DRY_RUN        = os.environ.get("DRY_RUN", "true").lower() == "true"
 
-# ── Capa 2: Escáner Top 51-150 por volumen — zona volátil v19 ────────────────
-HUNTER_DROP_24H     = 10.0   # caída mínima en 24h (bajado de 15% → 10%)
-HUNTER_RSI_MAX      = 32     # RSI máximo (subido de 20 → 32, más señales)
-HUNTER_SCORE_MIN    = 4      # score técnico mínimo (bajado de 5 → 4)
-TOP50_RANK_MIN      = 51     # rango inicio del escaneo (posición 51...)
-TOP50_RANK_MAX      = 150    # rango fin del escaneo (...hasta posición 150)
+# ── Persistencia ──────────────────────────────────────────────────────────────
+POSITIONS_FILE = "positions.json"
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger(__name__)
+# ── Timing ────────────────────────────────────────────────────────────────────
+TRADE_LOOP_SEC = 15 * 60   # análisis cada 15 minutos
+RISK_LOOP_SEC  = 60        # vigilancia de riesgo cada 60 segundos
 
-# ── Radar Fijo: WATCHLIST IA & DePIN 2026 (Capa 1) ───────────────────────────
-WATCHLIST = {
-    "bittensor":    "TAO",    # Bittensor
-    "render-token": "RENDER", # Render Network
-    "fetch-ai":     "FET",    # Fetch.ai / ASI Alliance
-    "ondo-finance": "ONDO",   # Ondo Finance
-    "akash-network":"AKT",    # Akash Network
+# ── Capital (en USDC) ─────────────────────────────────────────────────────────
+TRADE_USDC     = 25.0      # dólares por compra
+MAX_POSITIONS  = 3         # máximo de compras simultáneas
+MIN_TRADE_USDC = 5.0       # mínimo operacional
+
+# ── Riesgo ────────────────────────────────────────────────────────────────────
+STOP_LOSS_PCT    = 2.5
+TAKE_PROFIT_PCT  = 4.0
+KILL_SWITCH_PCT  = 5.0     # parar todo si el total cae > 5% en el día
+
+# ── Estrategia ────────────────────────────────────────────────────────────────
+TIMEFRAME        = "15m"
+OHLCV_LIMIT      = 100
+RSI_BUY          = 32
+BTC_DROP_BLOCK   = 1.0     # no comprar si BTC bajó > 1% en la última hora
+
+# ── Lista fija de monedas a vigilar (en USDC) ─────────────────────────────────
+WATCHLIST = [
+    "TAO/USDC",
+    "RENDER/USDC",
+    "FET/USDC",
+    "SOL/USDC",
+]
+
+# Nombres amigables para los mensajes de Telegram
+COIN_NAMES = {
+    "TAO/USDC":    "TAO (Bittensor)",
+    "RENDER/USDC": "Render",
+    "FET/USDC":    "Fetch.AI",
+    "SOL/USDC":    "Solana",
 }
 
-# ── Catálogo ──────────────────────────────────────────────────────────────────
-CATALOGUE = {}
-TOP_IDS   = []
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger(__name__)
 
-# ── Estado ────────────────────────────────────────────────────────────────────
-state = {
-    "portfolio":    {},
-    "cancel":       False,
-    "last_monitor": None,
-    "prev_prices":  {},
+# ══════════════════════════════════════════════════════════════════════════════
+# ESTADO GLOBAL
+# ══════════════════════════════════════════════════════════════════════════════
+state: dict = {
+    "positions":          {},
+    "kill_switch":        False,
+    "kill_switch_reason": "",
+    "daily_start_bal":    None,
+    "daily_date":         None,
+    "daily_realized_pnl": 0.0,
+    "trades_today":       0,
+    "last_scan":          "Nunca",
 }
 
 def load_state():
-    if os.path.exists(PORTFOLIO_FILE):
+    if os.path.exists(POSITIONS_FILE):
         try:
-            with open(PORTFOLIO_FILE) as f:
-                saved = json.load(f)
-                raw_portfolio = saved.get("portfolio", {})
-                # ── Migración automática v15 → v16 ──────────────────────────
-                migrated = {}
-                for cid, pos in raw_portfolio.items():
-                    if "cantidad_tokens" in pos and "total_invertido_eur" in pos:
-                        migrated[cid] = pos   # ya es formato v16
-                    elif "units" in pos and "avg_buy" in pos:
-                        # Convertir v15 → v16: invertido = avg_buy × units
-                        migrated[cid] = {
-                            "total_invertido_eur": round(pos["avg_buy"] * pos["units"], 4),
-                            "cantidad_tokens":      pos["units"],
-                        }
-                        log.info("Migrado v15→v16: %s", cid)
-                    else:
-                        migrated[cid] = pos
-                state["portfolio"]   = migrated
-                state["prev_prices"] = saved.get("prev_prices", {})
-            log.info("Cartera cargada: %d activos", len(state["portfolio"]))
+            with open(POSITIONS_FILE) as f:
+                state.update(json.load(f))
+            log.info("Estado cargado — %d posiciones abiertas",
+                     len(state["positions"]))
         except Exception as e:
-            log.warning("Error cargando cartera: %s", e)
+            log.warning("Error cargando estado: %s", e)
 
 def save_state():
     try:
-        with open(PORTFOLIO_FILE, "w") as f:
-            json.dump({
-                "portfolio":  state["portfolio"],
-                "prev_prices": state["prev_prices"],
-            }, f, indent=2)
+        with open(POSITIONS_FILE, "w") as f:
+            json.dump(state, f, indent=2, default=str)
     except Exception as e:
-        log.error("Error guardando: %s", e)
+        log.error("Error guardando estado: %s", e)
 
-# ── HTTP robusto (siempre en executor) ────────────────────────────────────────
-def _get(url, params=None, retries=3):
-    import time
-    for i in range(retries):
-        try:
-            r = requests.get(url, params=params, timeout=25)
-            if r.status_code == 429:
-                wait = 12 * (i + 1)
-                log.warning("Rate limit CoinGecko — esperando %ds", wait)
-                time.sleep(wait)
-                continue
-            if r.status_code in (502, 503):
-                time.sleep(8)
-                continue
-            r.raise_for_status()
-            return r.json()
-        except requests.exceptions.Timeout:
-            time.sleep(5)
-        except Exception as e:
-            log.warning("_get intento %d: %s", i + 1, e)
-            time.sleep(3)
-    return None
+# ══════════════════════════════════════════════════════════════════════════════
+# EXCHANGE — OKX via CCXT
+# ══════════════════════════════════════════════════════════════════════════════
+_exchange: Optional[ccxt.okx] = None
 
-async def run(fn, *args, **kwargs):
+def get_exchange() -> ccxt.okx:
+    """
+    Conector OKX SPOT.
+    - password = passphrase (tercer factor exclusivo de OKX)
+    - defaultType='spot' → cuenta Trading, mercado Spot
+    - adjustForTimeDifference evita errores de firma en Railway (IP dinámica)
+    """
+    global _exchange
+    if _exchange is None:
+        _exchange = ccxt.okx({
+            "apiKey":   OKX_API_KEY,
+            "secret":   OKX_SECRET,
+            "password": OKX_PASSPHRASE,
+            "options": {
+                "defaultType":             "spot",
+                "adjustForTimeDifference": True,
+            },
+            "enableRateLimit": True,
+        })
+    return _exchange
+
+async def _async(fn, *args, **kwargs):
+    """Ejecuta función síncrona de CCXT en el threadpool sin bloquear asyncio."""
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, partial(fn, *args, **kwargs))
 
-# ── CoinGecko API ─────────────────────────────────────────────────────────────
-def _fetch_prices(coin_ids):
-    import time
-    if not coin_ids:
-        return {}
-    result = {}
-    ids = list(dict.fromkeys(coin_ids))
-    for i in range(0, len(ids), 50):
-        data = _get(f"{GECKO}/simple/price", {
-            "ids":                 ",".join(ids[i:i+50]),
-            "vs_currencies":       CURRENCY,
-            "include_24hr_change": "true",
-            "include_7d_change":   "true",
-            "include_24hr_vol":    "true",
-            "include_market_cap":  "true",
-        })
-        if data:
-            result.update(data)
-        if i + 50 < len(ids):
-            time.sleep(1.5)
-    return result
-
-def _fetch_history(coin_id, days=30):
-    data = _get(f"{GECKO}/coins/{coin_id}/market_chart", {
-        "vs_currency": CURRENCY,
-        "days":        days,
-        "interval":    "daily",
-    })
-    return [p[1] for p in data.get("prices", [])] if data else []
-
-def _fetch_ohlc(coin_id, days=2):
-    return _get(f"{GECKO}/coins/{coin_id}/ohlc", {
-        "vs_currency": CURRENCY,
-        "days":        days,
-    }) or []
-
-def _fetch_catalogue():
-    data = _get(f"{GECKO}/coins/list", {"include_platform": "false"})
-    if data:
-        for c in data:
-            CATALOGUE[c["id"]] = {"symbol": c["symbol"].upper(), "name": c["name"]}
-        log.info("Catálogo: %d monedas", len(CATALOGUE))
-
-def _fetch_top_ids():
-    import time
-    ids = []
-    for page in [1, 2, 3]:
-        data = _get(f"{GECKO}/coins/markets", {
-            "vs_currency": CURRENCY,
-            "order":       "market_cap_desc",
-            "per_page":    100,
-            "page":        page,
-            "sparkline":   "false",
-        })
-        if data:
-            ids.extend(c["id"] for c in data)
-        time.sleep(1.5)
-    TOP_IDS.extend(ids)
-    log.info("TOP_IDS: %d", len(TOP_IDS))
-
-def _fetch_top_markets():
-    """Top 100 monedas con precios incluidos (para /mercado y Market Hunter)."""
-    import time
-    result = []
-    for page in [1, 2]:
-        data = _get(f"{GECKO}/coins/markets", {
-            "vs_currency":             CURRENCY,
-            "order":                   "market_cap_desc",
-            "per_page":                50,
-            "page":                    page,
-            "sparkline":               "false",
-            "price_change_percentage": "24h,7d",
-        })
-        if data:
-            result.extend(data)
-        time.sleep(1.5)
-    return result
-
-def _fetch_hunter_markets():
-    """
-    Capa 2 v19 — Escáner Aggressive Hunter: posiciones 51-150 por volumen.
-    Zona de mayor volatilidad: más oportunidades de rebote intradía.
-
-    Dos llamadas paginadas al endpoint /coins/markets ordenado por volume_desc:
-      · Página 2 → posiciones 51-100
-      · Página 3 → posiciones 101-150
-
-    Los precios y cambios 24h/7d vienen en la respuesta — sin llamada extra.
-    Pausa entre páginas para respetar el rate-limit de CoinGecko (≤30 req/min).
-    """
-    import time
-    result = []
-    for page in [2, 3]:   # pág 2 = rank 51-100, pág 3 = rank 101-150
-        data = _get(f"{GECKO}/coins/markets", {
-            "vs_currency":             CURRENCY,
-            "order":                   "volume_desc",
-            "per_page":                50,
-            "page":                    page,
-            "sparkline":               "false",
-            "price_change_percentage": "24h,7d",
-        })
-        if data:
-            result.extend(data)
-        time.sleep(1.5)   # pausa cortesía entre páginas
-    return result
-
-def _fetch_global():
-    data = _get(f"{GECKO}/global")
-    if data:
-        gd = data.get("data", {})
-        return {
-            "btc_dominance":  round(gd.get("market_cap_percentage", {}).get("btc", 0), 1),
-            "total_cap_eur":  gd.get("total_market_cap", {}).get(CURRENCY, 0),
-            "cap_change_24h": round(gd.get("market_cap_change_percentage_24h_usd", 0), 2),
-        }
-    return {"btc_dominance": 0, "total_cap_eur": 0, "cap_change_24h": 0}
-
-# ── Análisis técnico de una moneda (síncrono, para executor) ──────────────────
-def _do_full_analysis(coin_id, price_info):
-    import time
-    price = price_info.get(CURRENCY, 0)
-    chg24 = price_info.get(f"{CURRENCY}_24h_change", 0) or 0
-    chg7  = price_info.get(f"{CURRENCY}_7d_change",  0) or 0
-
-    hist = _fetch_history(coin_id, 30)
-    sc_d, reas_d, rsi_d, ema7_d, ema14_d, macd_d, bb_d, vs7_d, vs14_d = \
-        score_prices(hist, price, chg24, chg7)
-    conf_d = calc_conf(sc_d)
-    target = round(price * (1 + max(0.05, abs(vs7_d)/100 + 0.03)), 8)
-    sl     = round(price * (1 - max(0.04, abs(vs14_d)/100 + 0.02)), 8)
-
-    time.sleep(0.5)
-
-    ohlc = _fetch_ohlc(coin_id, 2)
-    sc_4h, reas_4h, conf_4h, sig_4h = 0, [], 50, "⚪ MANTENER"
-    if ohlc and len(ohlc) >= 8:
-        closes = [c[4] for c in ohlc]
-        sc_4h, reas_4h, *_ = score_prices(closes[:-1], closes[-1], chg24, 0)
-        conf_4h = calc_conf(sc_4h)
-        sig_4h  = signal_label(sc_4h)
-        reas_4h = reas_4h[:2]
-
-    return {
-        "price":    price,  "chg24": chg24, "chg7": chg7,
-        "signal":   signal_label(sc_d), "confidence": conf_d, "score": sc_d,
-        "rsi":      rsi_d,  "ema7": ema7_d, "ema14": ema14_d,
-        "bb_pos":   bb_d,   "target": target, "stop_loss": sl,
-        "reasons":  reas_d,
-        "signal_4h": sig_4h, "confidence_4h": conf_4h, "score_4h": sc_4h,
-        "reasons_4h": reas_4h,
-    }
-
-def _do_hunter_analysis(coin_id, price_info):
-    """
-    Análisis simplificado para el Market Hunter.
-    Solo necesitamos RSI y score — sin OHLC para no saturar la API.
-    """
-    import time
-    price = price_info.get(CURRENCY, 0)
-    chg24 = price_info.get(f"{CURRENCY}_24h_change", 0) or 0
-    chg7  = price_info.get(f"{CURRENCY}_7d_change",  0) or 0
-
-    hist = _fetch_history(coin_id, 30)
-    if not hist:
-        return None
-
-    sc, reas, rsi, ema7, ema14, macd_v, bb_pos, vs7, vs14 = \
-        score_prices(hist, price, chg24, chg7)
-    conf = calc_conf(sc)
-    target = round(price * (1 + max(0.05, abs(vs7)/100 + 0.03)), 8)
-    sl     = round(price * (1 - max(0.04, abs(vs14)/100 + 0.02)), 8)
-
-    time.sleep(0.8)   # pausa más larga para no saturar en el scan masivo
-
-    return {
-        "price": price, "chg24": chg24, "chg7": chg7,
-        "score": sc, "rsi": rsi, "confidence": conf,
-        "signal": signal_label(sc),
-        "target": target, "stop_loss": sl,
-        "reasons": reas,
-    }
-
-# ── Catálogo helpers ──────────────────────────────────────────────────────────
-def sym(coin_id):
-    return CATALOGUE.get(coin_id, {}).get("symbol", coin_id.upper())
-
-def coin_name(coin_id):
-    return CATALOGUE.get(coin_id, {}).get("name", coin_id)
-
-def resolve_coin(text):
-    u = text.strip().lower()
-    if u in CATALOGUE:
-        return u
-    by_sym = [c for c, d in CATALOGUE.items() if d["symbol"].lower() == u]
-    if by_sym:
-        for t in TOP_IDS:
-            if t in by_sym:
-                return t
-        return by_sym[0]
-    by_name = [c for c, d in CATALOGUE.items() if d["name"].lower() == u]
-    if by_name:
-        return by_name[0]
-    partial = [c for c, d in CATALOGUE.items()
-               if u in d["symbol"].lower() or u in d["name"].lower()]
-    if partial:
-        for t in TOP_IDS:
-            if t in partial:
-                return t
-        return partial[0]
-    data = _get(f"{GECKO}/search", {"query": text})
-    if data:
-        hits = data.get("coins", [])
-        if hits:
-            cid = hits[0]["id"]
-            if cid not in CATALOGUE:
-                CATALOGUE[cid] = {"symbol": hits[0]["symbol"].upper(), "name": hits[0]["name"]}
-            return cid
-    return None
-
-# ── Indicadores técnicos ──────────────────────────────────────────────────────
-def calc_rsi(prices, period=14):
-    if len(prices) < period + 1:
-        return 50.0
-    d  = [prices[i] - prices[i-1] for i in range(1, len(prices))]
-    g  = [max(x, 0) for x in d[-period:]]
-    l  = [max(-x, 0) for x in d[-period:]]
-    ag, al = sum(g)/period, sum(l)/period
-    return round(100 - 100/(1 + ag/al), 2) if al else 100.0
-
-def calc_ema(prices, period):
+# ══════════════════════════════════════════════════════════════════════════════
+# INDICADORES TÉCNICOS (puro Python, sin librerías externas)
+# ══════════════════════════════════════════════════════════════════════════════
+def _ema(prices: list, period: int) -> float:
     if not prices:
         return 0.0
-    k, e = 2/(period+1), prices[0]
+    k, e = 2.0 / (period + 1), float(prices[0])
     for p in prices[1:]:
-        e = p*k + e*(1-k)
+        e = float(p) * k + e * (1.0 - k)
     return e
 
-def calc_macd(prices):
-    if len(prices) < 26:
-        return 0.0, 0.0
-    m = calc_ema(prices, 12) - calc_ema(prices, 26)
-    return round(m, 8), round(m*0.85, 8)
+def _rsi(closes: list, period: int = 14) -> float:
+    if len(closes) < period + 1:
+        return 50.0
+    deltas = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
+    gains  = [max(d,  0.0) for d in deltas[-period:]]
+    losses = [max(-d, 0.0) for d in deltas[-period:]]
+    ag, al = sum(gains) / period, sum(losses) / period
+    return 100.0 if al == 0 else round(100.0 - 100.0 / (1.0 + ag / al), 2)
 
-def calc_bb(prices, period=20):
-    if len(prices) < period:
-        p = prices[-1] if prices else 0
-        return p, p, p
-    w   = prices[-period:]
-    avg = sum(w)/period
-    std = (sum((x-avg)**2 for x in w)/period)**0.5
-    return round(avg-2*std, 8), round(avg, 8), round(avg+2*std, 8)
-
-def score_prices(prices, price, chg24, chg7):
-    all_p  = prices + [price]
-    rsi    = calc_rsi(all_p)
-    ema7   = calc_ema(all_p, 7)
-    ema14  = calc_ema(all_p, 14)
-    macd_v, macd_s = calc_macd(all_p)
-    bb_lo, _, bb_hi = calc_bb(all_p)
-    vs7    = (price - ema7)  / ema7  * 100 if ema7  else 0
-    vs14   = (price - ema14) / ema14 * 100 if ema14 else 0
-    bb_pos = (price - bb_lo) / (bb_hi - bb_lo) * 100 if (bb_hi - bb_lo) else 50
-    score, reasons = 0, []
-
-    if rsi <= 25:    score += 3; reasons.append(f"RSI sobreventa extrema ({rsi})")
-    elif rsi <= 35:  score += 2; reasons.append(f"RSI sobreventa ({rsi})")
-    elif rsi <= 45:  score += 1; reasons.append(f"RSI bajo ({rsi})")
-    elif rsi >= 75:  score -= 3; reasons.append(f"RSI sobrecompra extrema ({rsi})")
-    elif rsi >= 65:  score -= 2; reasons.append(f"RSI elevado ({rsi})")
-    elif rsi >= 55:  score -= 1; reasons.append(f"RSI alto ({rsi})")
-
-    if macd_v > 0 and macd_v > macd_s:   score += 2; reasons.append("MACD alcista (cruce positivo)")
-    elif macd_v > 0:                       score += 1; reasons.append("MACD positivo")
-    elif macd_v < 0 and macd_v < macd_s:  score -= 2; reasons.append("MACD bajista (cruce negativo)")
-    else:                                  score -= 1; reasons.append("MACD negativo")
-
-    if vs7 < -5:    score += 2; reasons.append(f"Precio {abs(vs7):.1f}% bajo EMA7")
-    elif vs7 < -2:  score += 1; reasons.append(f"Bajo EMA7 ({vs7:.1f}%)")
-    elif vs7 > 8:   score -= 2; reasons.append(f"Extendido sobre EMA7 ({vs7:.1f}%)")
-    elif vs7 > 4:   score -= 1; reasons.append(f"Alto sobre EMA7 ({vs7:.1f}%)")
-
-    if ema7 > ema14: score += 1; reasons.append("EMA7 &gt; EMA14 — tendencia alcista")
-    else:            score -= 1; reasons.append("EMA7 &lt; EMA14 — tendencia bajista")
-
-    if bb_pos < 15:   score += 2; reasons.append("Cerca banda inferior Bollinger — rebote posible")
-    elif bb_pos > 85: score -= 2; reasons.append("Cerca banda superior Bollinger — posible techo")
-
-    if chg24 < -10:  score += 1; reasons.append(f"Caída 24h ({chg24:.1f}%)")
-    elif chg24 > 15: score -= 1; reasons.append(f"Subida fuerte 24h ({chg24:.1f}%)")
-
-    return score, reasons, rsi, ema7, ema14, macd_v, bb_pos, vs7, vs14
-
-def signal_label(score):
-    if score >= 5:  return "🟢 COMPRAR FUERTE"
-    if score >= 3:  return "🟢 COMPRAR"
-    if score >= 1:  return "🟡 POSIBLE COMPRA"
-    if score <= -5: return "🔴 VENDER FUERTE"
-    if score <= -3: return "🔴 VENDER"
-    if score <= -1: return "🟠 POSIBLE VENTA"
-    return "⚪ MANTENER"
-
-def calc_conf(score):
-    return min(93, 60 + abs(score) * 5)
-
-def calc_trailing_stop(total_invertido_eur, cantidad_tokens, current_price):
-    """
-    Trailing stop basado en coste real.
-    Activa si el beneficio neto supera TRAILING_MIN_PROFIT%.
-    Stop = precio al que recuperas invertido + 1%.
-    """
-    if not cantidad_tokens or not total_invertido_eur:
-        return None, 0.0
-    valor_actual  = cantidad_tokens * current_price
-    beneficio_pct = ((valor_actual - total_invertido_eur) / total_invertido_eur * 100)
-    if beneficio_pct < TRAILING_MIN_PROFIT:
-        return None, beneficio_pct
-    # Precio mínimo para conservar break-even + 1%
-    trailing_sl = round(total_invertido_eur * 1.01 / cantidad_tokens, 8)
-    return trailing_sl, beneficio_pct
-
-# ── Formateo ──────────────────────────────────────────────────────────────────
-def fp(p):
-    if not p:     return f"0{CURRENCY_SYM}"
-    if p >= 1000: return f"{p:,.2f}{CURRENCY_SYM}"
-    if p >= 1:    return f"{p:.4f}{CURRENCY_SYM}"
-    if p >= 0.01: return f"{p:.6f}{CURRENCY_SYM}"
-    return f"{p:.8f}{CURRENCY_SYM}"
-
-def fv(v):
-    if v >= 1e9:  return f"{v/1e9:.2f}B{CURRENCY_SYM}"
-    if v >= 1e6:  return f"{v/1e6:.1f}M{CURRENCY_SYM}"
-    if v >= 1e3:  return f"{v/1e3:.1f}K{CURRENCY_SYM}"
-    return f"{v:.2f}{CURRENCY_SYM}"
-
-def pc(v):
-    return f"{'🟢 +' if v >= 0 else '🔴 '}{v:.2f}%"
-
-# ── Mensaje de análisis completo ──────────────────────────────────────────────
-def build_analysis_msg(coin_id, a, holding=None):
-    price = a["price"]
-    lines = [
-        f"📊 <b>{sym(coin_id)} — {coin_name(coin_id)}</b>",
-        f"💰 <b>{fp(price)}</b>   24h: {pc(a['chg24'])}   7d: {pc(a['chg7'])}",
-        "",
-        "┌─ AHORA (diario) ─────────────────",
-        f"│ {a['signal']}",
-        f"│ Confianza: {a['confidence']}%",
-        f"│ RSI: <code>{a['rsi']}</code>   Bollinger: <code>{a['bb_pos']:.0f}%</code>",
-        f"│ 🎯 Objetivo: <code>{fp(a['target'])}</code> (+{((a['target']/price-1)*100):.1f}%)" if price else "│",
-        f"│ 🛑 Stop-loss: <code>{fp(a['stop_loss'])}</code> (-{((1-a['stop_loss']/price)*100):.1f}%)" if price else "│",
-        "│",
-        "│ Razones:",
+def _macd_histogram_series(closes: list) -> list:
+    """Serie de histogramas MACD para detectar el giro alcista."""
+    if len(closes) < 35:
+        return []
+    macd_vals = [
+        _ema(closes[:i + 1], 12) - _ema(closes[:i + 1], 26)
+        for i in range(26, len(closes))
     ]
-    for r in a["reasons"][:4]:
-        lines.append(f"│  · {r}")
-    lines += [
-        "│",
-        "└─ PREDICCIÓN 4H ──────────────────",
-        f"  {a['signal_4h']}   Conf: {a['confidence_4h']}%",
+    signal_vals = [
+        _ema(macd_vals[:i + 1], 9)
+        for i in range(8, len(macd_vals))
     ]
-    for r in a["reasons_4h"]:
-        lines.append(f"  · {r}")
-    if holding:
-        tokens  = holding["cantidad_tokens"]
-        inv_eur = holding["total_invertido_eur"]
-        cur_val = price * tokens
-        ben_net = cur_val - inv_eur
-        ben_pct = (ben_net / inv_eur * 100) if inv_eur else 0
-        trailing_sl, _ = calc_trailing_stop(inv_eur, tokens, price)
-        # Precio de break-even exacto
-        breakeven_price = (inv_eur / tokens) if tokens else 0
-        lines += [
-            "",
-            "┌─ TU POSICIÓN (Coste Real) ────────",
-            f"│ {tokens} tokens · Invertido real: {fp(inv_eur)}",
-            f"│ Break-even: {fp(breakeven_price)} por token",
-            f"│ Valor actual: {fp(cur_val)}",
-            f"└ {'💰' if ben_net>=0 else '📉'} Beneficio Neto: {fp(ben_net)} ({ben_pct:+.2f}%)",
-        ]
-        if trailing_sl:
-            lines.append(f"  🔒 Trailing stop: {fp(trailing_sl)} (break-even +1%)")
-    lines.append(f"\n_🕐 {datetime.now().strftime('%d/%m %H:%M')}_")
-    return "\n".join(lines)
+    if len(signal_vals) < 2:
+        return []
+    return [m - s for m, s in zip(macd_vals[8:], signal_vals)]
 
-def build_hunter_alert(coin_id, a, now_str, layer="📡 RADAR FIJO"):
+def _macd_turning_bullish(closes: list) -> bool:
     """
-    Mensaje de alerta para oportunidades de entrada.
-    layer: etiqueta de la capa que generó la señal
-      - "📡 RADAR FIJO IA/DePIN"
-      - "🔍 ESCÁNER TOP 51-150"
+    True si el MACD muestra un giro alcista:
+    · Cruce confirmado: histograma pasó de negativo a ≥0
+    · Giro inminente:   histograma negativo pero creciendo 2 velas seguidas
     """
-    price = a["price"]
-    lines = [
-        f"🎯 <b>OPORTUNIDAD DE ENTRADA DETECTADA</b>",
-        f"<b>Fuente:</b> <code>{layer}</code>",
-        f"",
-        f"<b>{sym(coin_id)} — {coin_name(coin_id)}</b>",
-        f"💰 Precio: <b>{fp(price)}</b>",
-        f"📉 Caída 24h: {pc(a['chg24'])}",
-        f"📅 Cambio 7d: {pc(a['chg7'])}",
-        f"",
-        f"<b>Indicadores técnicos:</b>",
-        f"  RSI: <code>{a['rsi']}</code> — {'Sobreventa extrema ⚠️' if a['rsi'] < 20 else 'Sobreventa confirmada'}",
-        f"  Score: <code>{a['score']}</code> — Señal {'fuerte' if a['score'] >= 5 else 'moderada'}",
-        f"  Confianza: <code>{a['confidence']}%</code>",
-        f"  Señal: {a['signal']}",
-        f"",
-        f"<b>Razones:</b>",
-    ]
-    for r in a["reasons"][:5]:
-        lines.append(f"  · {r}")
-    lines += [
-        f"",
-        f"<b>Niveles sugeridos:</b>",
-        f"  🎯 Objetivo: <code>{fp(a['target'])}</code> (+{((a['target']/price-1)*100):.1f}%)" if price else "",
-        f"  🛑 Stop-loss: <code>{fp(a['stop_loss'])}</code> (-{((1-a['stop_loss']/price)*100):.1f}%)" if price else "",
-        f"",
-        f"<i>⚠️ Solo informativo. Haz tu propio análisis antes de invertir.</i>",
-        f"_{layer} — {now_str}_",
-    ]
-    return "\n".join(l for l in lines if l is not None)
+    hist = _macd_histogram_series(closes)
+    if len(hist) < 3:
+        return False
+    h0, h1, h2 = hist[-1], hist[-2], hist[-3]
+    cross_up = h1 < 0.0 <= h0
+    turning  = h0 < 0.0 and h0 > h1 > h2
+    return cross_up or turning
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MONITOR DUAL CADA 4H
+# HELPERS DE EXCHANGE
 # ══════════════════════════════════════════════════════════════════════════════
-async def monitor_loop(app):
-    await asyncio.sleep(30)
-    log.info("Monitor dual %dh iniciado", MONITOR_HOURS)
-    while True:
-        try:
-            await do_monitor(app.bot)
-        except Exception as e:
-            log.error("Error crítico en monitor: %s", e)
-        log.info("Próximo monitor en %dh", MONITOR_HOURS)
-        await asyncio.sleep(MONITOR_HOURS * 3600)
+def _round_step(value: float, step: float) -> float:
+    """Trunca al múltiplo de step más cercano por debajo (nunca superar el saldo)."""
+    if step <= 0:
+        return value
+    dec = max(0, -int(math.floor(math.log10(step)))) if step < 1.0 else 0
+    return round(math.floor(value / step) * step, dec)
 
-async def do_monitor(bot):
-    now_str = datetime.now().strftime("%d/%m %H:%M")
-    state["last_monitor"] = now_str
-    log.info("Monitor dual iniciando — %s", now_str)
+def _fetch_usdc_free() -> float:
+    """Saldo libre de USDC en la cuenta Trading (Spot) de OKX."""
+    ex  = get_exchange()
+    bal = ex.fetch_balance()
+    return float((bal.get("USDC") or {}).get("free", 0.0) or 0.0)
 
-    portfolio   = state["portfolio"]
-    alerts_a    = []   # alertas de Fase A (cartera)
-    pnl_list    = []   # para el reporte final
-    gangas      = []   # oportunidades encontradas en Fase B
+def _fetch_total_portfolio_usdc() -> float:
+    """
+    Valoración total en USDC:
+    USDC libre + valor de mercado de los tokens en posiciones abiertas.
+    """
+    ex    = get_exchange()
+    bal   = ex.fetch_balance()
+    total = float((bal.get("USDC") or {}).get("total", 0.0) or 0.0)
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # FASE A — Gestión de Cartera
-    # ══════════════════════════════════════════════════════════════════════════
-    if portfolio:
-        log.info("Fase A: analizando %d activos de cartera", len(portfolio))
-
-        prices_data = await run(_fetch_prices, list(portfolio.keys()))
-        global_data = await run(_fetch_global)
-
-        for coin_id, pos in portfolio.items():
-            try:
-                info = prices_data.get(coin_id)
-                if not info:
-                    log.warning("Fase A: sin precio para %s", coin_id)
-                    continue
-
-                price = info.get(CURRENCY, 0)
-                chg24 = info.get(f"{CURRENCY}_24h_change", 0) or 0
-                if not price:
-                    continue
-
-                # ── Coste Real v17 ────────────────────────────────────────────
-                tokens   = pos["cantidad_tokens"]
-                inv_eur  = pos["total_invertido_eur"]
-                cur_val  = price * tokens
-                ben_net  = cur_val - inv_eur                    # beneficio neto real
-                ben_pct  = (ben_net / inv_eur * 100) if inv_eur else 0
-                # Precio de break-even exacto
-                be_price = (inv_eur / tokens) if tokens else 0
-
-                pnl_list.append((coin_id, ben_pct, price, cur_val))
-
-                # ── Detector de volatilidad ───────────────────────────────────
-                prev_price = state["prev_prices"].get(coin_id)
-                if prev_price and prev_price > 0:
-                    vol_pct = abs((price - prev_price) / prev_price * 100)
-                    if vol_pct >= VOLATILITY_PCT:
-                        direction = "subida" if price > prev_price else "caída"
-                        alerts_a.append(
-                            f"⚡ <b>ALTA VOLATILIDAD — {sym(coin_id)}</b>\n"
-                            f"_{direction.capitalize()} del {vol_pct:.1f}% en las últimas {MONITOR_HOURS}h_\n\n"
-                            f"  Precio: <b>{fp(price)}</b>   24h: {pc(chg24)}\n"
-                            f"  Beneficio Neto Real: {fp(ben_net)} ({ben_pct:+.2f}%)\n"
-                            f"_Monitor {now_str}_"
-                        )
-
-                state["prev_prices"][coin_id] = price
-
-                # ── Análisis técnico completo ─────────────────────────────────
-                a = await run(_do_full_analysis, coin_id, info)
-                trailing_sl, _ = calc_trailing_stop(inv_eur, tokens, price)
-                drop_from_be   = ((be_price - price) / be_price * 100) if be_price else 0
-
-                # 1. Oportunidad DCA
-                if drop_from_be >= DCA_DROP_PCT and a["rsi"] < 35:
-                    alerts_a.append(
-                        f"💡 <b>OPORTUNIDAD DCA — {sym(coin_id)}</b>\n"
-                        f"_Caída del {drop_from_be:.1f}% sobre tu break-even + RSI en sobreventa_\n\n"
-                        f"  Precio actual: <b>{fp(price)}</b>\n"
-                        f"  Tu break-even: {fp(be_price)}\n"
-                        f"  RSI: <code>{a['rsi']}</code> — Zona de acumulación\n"
-                        f"  Beneficio Neto Real: {fp(ben_net)} ({ben_pct:+.2f}%)\n\n"
-                        f"  Promediar bajaría tu coste medio y mejoraría el break-even.\n"
-                        f"  ⚠️ Solo si tienes convicción en el activo.\n"
-                        f"_Monitor {now_str}_"
-                    )
-                    continue
-
-                # 2. Trailing stop amenazado
-                if trailing_sl and price <= trailing_sl * 1.01:
-                    alerts_a.append(
-                        f"🔒 <b>TRAILING STOP — {sym(coin_id)}</b>\n"
-                        f"<i>El precio se acerca al stop dinámico de break-even</i>\n\n"
-                        f"  Precio actual: <b>{fp(price)}</b>\n"
-                        f"  Trailing stop: {fp(trailing_sl)}\n"
-                        f"  Beneficio Neto Real: {fp(ben_net)} ({ben_pct:+.2f}%)\n"
-                        f"  Considera vender para proteger tus ganancias.\n"
-                        f"_Monitor {now_str}_"
-                    )
-                    continue
-
-                # ── Nota break-even para alertas de venta ────────────────────
-                def _breakeven_note():
-                    """Aviso si los indicadores piden vender pero aún no cubres costes."""
-                    if ben_net < 0:
-                        return (
-                            f"\n⚠️ <b>Nota:</b> Los indicadores sugieren salida, pero tu posición "
-                            f"actual es de <b>{fp(ben_net)}</b> "
-                            f"(aún no has alcanzado el punto de equilibrio)"
-                        )
-                    return ""
-
-                # 3. Señal técnica fuerte de venta
-                if a["score"] <= -3 and a["confidence"] >= SELL_CONF_MIN:
-                    alerts_a.append(
-                        f"🚨 <b>ALERTA VENTA — {sym(coin_id)}</b>\n"
-                        f"<i>Señales técnicas apuntan a presión bajista</i>\n\n"
-                        f"  Precio: <b>{fp(price)}</b>   24h: {pc(chg24)}\n"
-                        f"  Señal diaria: {a['signal']} ({a['confidence']}%)\n"
-                        f"  Señal 4h: {a['signal_4h']} ({a['confidence_4h']}%)\n"
-                        f"  RSI: <code>{a['rsi']}</code>\n\n"
-                        f"  Razones:\n"
-                        + "\n".join(f"  · {r}" for r in a["reasons"][:3])
-                        + f"\n\n  💶 Beneficio Neto Real: {fp(ben_net)} ({ben_pct:+.2f}%)"
-                        + _breakeven_note()
-                        + f"\n_Monitor {now_str}_"
-                    )
-
-                # 4. Bajista en diario y 4h simultáneo
-                elif a["score"] <= -2 and a["score_4h"] <= -2 and a["confidence"] >= SELL_CONF_MIN:
-                    alerts_a.append(
-                        f"🚨 <b>SEÑAL BAJISTA CONFIRMADA — {sym(coin_id)}</b>\n"
-                        f"<i>Tendencia bajista en timeframe diario y 4h</i>\n\n"
-                        f"  Precio: <b>{fp(price)}</b>   24h: {pc(chg24)}\n"
-                        f"  Diario: {a['signal']} | 4H: {a['signal_4h']}\n"
-                        f"  💶 Beneficio Neto Real: {fp(ben_net)} ({ben_pct:+.2f}%)"
-                        + _breakeven_note()
-                        + f"\n_Monitor {now_str}_"
-                    )
-
-                # 5. RSI sobrecompra + beneficio significativo
-                elif a["rsi"] >= 75 and ben_pct >= 10:
-                    alerts_a.append(
-                        f"⚠️ <b>TOMA DE GANANCIAS — {sym(coin_id)}</b>\n"
-                        f"<i>RSI en sobrecompra extrema con beneficio acumulado</i>\n\n"
-                        f"  Precio: <b>{fp(price)}</b>\n"
-                        f"  RSI: <code>{a['rsi']}</code> — Sobrecompra\n"
-                        f"  💶 Beneficio Neto Real: {fp(ben_net)} ({ben_pct:+.2f}%)\n"
-                        f"  Considera tomar parcialmente los beneficios.\n"
-                        f"_Monitor {now_str}_"
-                    )
-
-                # 6. Objetivo de beneficio alcanzado
-                elif ben_pct >= PROFIT_ALERT and a["score"] <= 0:
-                    alerts_a.append(
-                        f"💰 <b>OBJETIVO BENEFICIO — {sym(coin_id)}</b>\n"
-                        f"_Has superado +{PROFIT_ALERT:.0f}% con señal neutral o bajista_\n\n"
-                        f"  Precio: <b>{fp(price)}</b>\n"
-                        f"  💶 Beneficio Neto Real: {fp(ben_net)} ({ben_pct:+.2f}%)\n"
-                        f"  Señal: {a['signal']}\n"
-                        f"  Considera asegurar parte de las ganancias.\n"
-                        f"_Monitor {now_str}_"
-                    )
-
-                # 7. Stop-loss clásico cercano
-                elif price <= a["stop_loss"] * 1.02:
-                    alerts_a.append(
-                        f"🛑 <b>STOP-LOSS CERCANO — {sym(coin_id)}</b>\n"
-                        f"<i>El precio se acerca al nivel de stop-loss sugerido</i>\n\n"
-                        f"  Precio actual: <b>{fp(price)}</b>\n"
-                        f"  Stop-loss sugerido: {fp(a['stop_loss'])}\n"
-                        f"  💶 Beneficio Neto Real: {fp(ben_net)} ({ben_pct:+.2f}%)"
-                        + _breakeven_note()
-                        + f"\n_Monitor {now_str}_"
-                    )
-
-                await asyncio.sleep(0.8)
-
-            except Exception as e:
-                log.error("Fase A error en %s: %s", coin_id, e)
-                continue
-
-        # Guardar precios del ciclo
-        save_state()
-
-    else:
-        log.info("Fase A: cartera vacía, saltando")
-        global_data = await run(_fetch_global)
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # FASE B — CAPA 1: Radar Fijo IA/DePIN (gatillos agresivos v19)
-    # Umbral: caída>10% OR RSI<32  (cualquiera basta)
-    # ══════════════════════════════════════════════════════════════════════════
-    log.info("Fase B — Radar Fijo: escaneando %d monedas WATCHLIST", len(WATCHLIST))
-
-    # Registrar símbolos en catálogo si aún no están
-    for wid, wsym_str in WATCHLIST.items():
-        if wid not in CATALOGUE:
-            CATALOGUE[wid] = {"symbol": wsym_str, "name": wsym_str}
-
-    try:
-        wl_prices = await run(_fetch_prices, list(WATCHLIST.keys()))
-    except Exception as e:
-        log.error("Fase B: error obteniendo precios watchlist: %s", e)
-        wl_prices = {}
-
-    for cid in WATCHLIST:
-        if cid not in wl_prices or cid in portfolio:
-            continue   # sin precio o ya está en cartera (cubierta por Fase A)
-
-        price_info = wl_prices[cid]
-        chg24 = price_info.get(f"{CURRENCY}_24h_change", 0) or 0
-        price = price_info.get(CURRENCY, 0)
-        if not price:
+    skip = {"USDC", "USDT", "info", "free", "used", "total",
+            "timestamp", "datetime"}
+    for coin, amounts in bal.items():
+        if coin in skip:
             continue
-
-        # Pre-filtro barato antes de hacer fetch_history (costoso)
-        pre_ok = (chg24 <= -RADAR_DROP_24H)   # si no cae lo suficiente, aún puede pasar por RSI
-        try:
-            a = await run(_do_hunter_analysis, cid, price_info)
-            if a is None:
-                continue
-
-            log.info("Fase B Radar: %s — 24h: %.1f%%, RSI: %s, score: %s",
-                     sym(cid), chg24, a["rsi"], a["score"])
-
-            # Umbral Capa 1: caída>8%  OR  RSI<30  (cualquiera basta)
-            if ((chg24 <= -RADAR_DROP_24H or a["rsi"] < RADAR_RSI_MAX)
-                    and a["score"] >= RADAR_SCORE_MIN):
-                log.info("Fase B Radar: SEÑAL — %s", sym(cid))
-                gangas.append((cid, a, "📡 RADAR FIJO IA/DePIN"))
-
-            await asyncio.sleep(1.2)
-
-        except Exception as e:
-            log.warning("Fase B Radar: error en %s: %s", cid, e)
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # FASE C — CAPA 2: Aggressive Hunter — Top 51-150 por Volumen (v19)
-    # Zona de mayor volatilidad. Umbral: caída>10% Y RSI<32.
-    # Precios incluidos en /coins/markets — sin llamada extra de precio.
-    # ══════════════════════════════════════════════════════════════════════════
-    log.info("Fase C — Aggressive Hunter: escaneando posiciones 51-150 por volumen")
-
-    try:
-        hunter_markets = await run(_fetch_hunter_markets)
-    except Exception as e:
-        log.error("Fase C: error obteniendo mercados 51-150: %s", e)
-        hunter_markets = []
-
-    if hunter_markets:
-        watchlist_ids_set = set(WATCHLIST.keys())
-        c2_candidates = []
-        for c in hunter_markets:
-            cid   = c.get("id", "")
-            chg24 = c.get("price_change_percentage_24h", 0) or 0
-            price = c.get("current_price", 0) or 0
-            if not cid or not price:
-                continue
-            # Actualizar catálogo con datos frescos
-            if cid not in CATALOGUE:
-                CATALOGUE[cid] = {
-                    "symbol": c.get("symbol", "").upper(),
-                    "name":   c.get("name", ""),
-                }
-            # Excluir monedas ya en cartera o en watchlist
-            if cid in portfolio or cid in watchlist_ids_set:
-                continue
-            # Pre-filtro: solo entran las que caen más del umbral agresivo
-            if chg24 <= -HUNTER_DROP_24H:
-                c2_candidates.append(c)
-
-        log.info("Fase C: %d candidatos pre-filtrados de %d monedas (rango 51-150)",
-                 len(c2_candidates), len(hunter_markets))
-
-        for c in c2_candidates:
-            cid   = c.get("id", "")
-            chg24 = c.get("price_change_percentage_24h", 0) or 0
-            chg7  = c.get("price_change_percentage_7d_in_currency", 0) or 0
-            price = c.get("current_price", 0) or 0
-
-            price_info_c2 = {
-                CURRENCY:                 price,
-                f"{CURRENCY}_24h_change": chg24,
-                f"{CURRENCY}_7d_change":  chg7,
-                f"{CURRENCY}_24h_vol":    c.get("total_volume", 0) or 0,
-                f"{CURRENCY}_market_cap": c.get("market_cap", 0) or 0,
-            }
+        qty = float((amounts or {}).get("total", 0.0) or 0.0)
+        if qty < 1e-8:
+            continue
+        # Intentar primero el par /USDC, luego /USDT como fallback
+        for quote in ("USDC", "USDT"):
             try:
-                a = await run(_do_hunter_analysis, cid, price_info_c2)
-                if a is None:
-                    continue
+                tk    = ex.fetch_ticker(f"{coin}/{quote}")
+                price = float(tk.get("last") or 0.0)
+                if price > 0:
+                    total += qty * price
+                    break
+            except Exception:
+                continue
+    return total
 
-                log.info("Fase C Hunter: %s — 24h: %.1f%%, RSI: %s, score: %s",
-                         sym(cid), chg24, a["rsi"], a["score"])
+def _fetch_ohlcv_closes(symbol: str, tf: str = "15m",
+                         limit: int = OHLCV_LIMIT) -> list:
+    ex    = get_exchange()
+    ohlcv = ex.fetch_ohlcv(symbol, tf, limit=limit)
+    return [float(c[4]) for c in ohlcv] if ohlcv else []
 
-                # Umbral agresivo: caída>10% AND RSI<32 AND score>=4
-                if (a["rsi"] < HUNTER_RSI_MAX and a["score"] >= HUNTER_SCORE_MIN):
-                    log.info("Fase C Hunter: SEÑAL — %s (RSI=%s, score=%s)",
-                             sym(cid), a["rsi"], a["score"])
-                    gangas.append((cid, a, "🔍 ESCÁNER TOP 51-150"))
+def _fetch_price(symbol: str) -> float:
+    ex = get_exchange()
+    return float((ex.fetch_ticker(symbol).get("last")) or 0.0)
 
-                await asyncio.sleep(1.5)
+def _fetch_btc_1h_change() -> float:
+    """Cambio % del BTC en la última hora completa (vela 1h)."""
+    ex    = get_exchange()
+    # Usamos BTC/USDT ya que BTC/USDC puede no tener liquidez en OKX
+    for pair in ("BTC/USDC", "BTC/USDT"):
+        try:
+            ohlcv = ex.fetch_ohlcv(pair, "1h", limit=2)
+            if ohlcv:
+                c = ohlcv[-1]
+                o, cl = float(c[1]), float(c[4])
+                return ((cl - o) / o * 100.0) if o else 0.0
+        except Exception:
+            continue
+    return 0.0
 
-            except Exception as e:
-                log.warning("Fase C Hunter: error en %s: %s", cid, e)
-    else:
-        log.warning("Fase C: no se pudieron obtener datos del rango 51-150")
-
-    # ── Enviar alertas Fase A ─────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# TELEGRAM — MENSAJES EN LENGUAJE LLANO
+# ══════════════════════════════════════════════════════════════════════════════
+async def _notify(bot: Bot, text: str):
+    """Envía mensaje de texto plano (sin HTML técnico) al usuario."""
     if not CHAT_ID:
-        log.warning("CHAT_ID no configurado — no se pueden enviar mensajes")
         return
+    try:
+        await bot.send_message(chat_id=CHAT_ID, text=text)
+    except Exception as e:
+        log.error("Error enviando Telegram: %s", e)
 
-    for alert_text in alerts_a:
-        try:
-            await bot.send_message(chat_id=CHAT_ID, text=alert_text, parse_mode="HTML")
-            await asyncio.sleep(0.5)
-        except Exception as e:
-            log.error("Error enviando alerta Fase A: %s", e)
+def _coin_label(symbol: str) -> str:
+    """Nombre amigable de la moneda para los mensajes."""
+    return COIN_NAMES.get(symbol, symbol.split("/")[0])
 
-    # ── Enviar oportunidades Fases B y C (gangas) ─────────────────────────────
-    for cid, a, layer in gangas:
-        try:
-            await bot.send_message(
-                chat_id    = CHAT_ID,
-                text       = build_hunter_alert(cid, a, now_str, layer=layer),
-                parse_mode="HTML",
-            )
-            await asyncio.sleep(0.5)
-        except Exception as e:
-            log.error("Error enviando alerta %s %s: %s", layer, cid, e)
-
-    # ── Reporte final ─────────────────────────────────────────────────────────
-    n_radar  = sum(1 for _, _, layer in gangas if "RADAR" in layer)
-    n_top50  = sum(1 for _, _, layer in gangas if "TOP 51" in layer)
-    await _send_monitor_report(
-        bot, pnl_list, global_data,
-        n_alerts_a = len(alerts_a),
-        n_radar    = n_radar,
-        n_top50    = n_top50,
-        now_str    = now_str,
+async def _msg_compra(bot: Bot, symbol: str, invested: float,
+                      price: float, total_bal: float):
+    """Mensaje de compra en lenguaje completamente llano."""
+    label    = _coin_label(symbol)
+    dry_note = "⚠️ [SIMULACIÓN - sin dinero real]\n\n" if DRY_RUN else ""
+    await _notify(bot,
+        f"{dry_note}"
+        f"👀 He visto una oportunidad y he comprado {label} "
+        f"usando {invested:.0f} dólares. ¡A ver cómo sale!\n\n"
+        f"💰 Tu dinero total ahora mismo: {total_bal:.2f} USDC"
     )
 
-async def _send_monitor_report(bot, pnl_list, global_data,
-                                n_alerts_a, n_radar, n_top50, now_str):
-    """Reporte consolidado al final del ciclo: cartera + mercado global + gangas."""
-    portfolio = state["portfolio"]
+async def _msg_venta_ganancia(bot: Bot, symbol: str, pnl: float,
+                               total_bal: float):
+    """Mensaje de venta con ganancias en lenguaje llano."""
+    label    = _coin_label(symbol)
+    dry_note = "⚠️ [SIMULACIÓN - sin dinero real]\n\n" if DRY_RUN else ""
+    await _notify(bot,
+        f"{dry_note}"
+        f"🎉 ¡Buenas noticias! He vendido {label} y hemos ganado "
+        f"{pnl:.2f} dólares. ¡Tu dinero total ahora es mayor!\n\n"
+        f"💰 Tu dinero total ahora mismo: {total_bal:.2f} USDC"
+    )
 
-    # Totales de cartera (coste real v17)
-    total_inv = total_cur = 0
-    for cid, ben_pct, price, cur_val in pnl_list:
-        pos       = portfolio.get(cid, {})
-        total_inv += pos.get("total_invertido_eur", 0)
-        total_cur += cur_val
+async def _msg_venta_perdida(bot: Bot, symbol: str, pnl: float,
+                              total_bal: float):
+    """Mensaje de venta con pérdidas en lenguaje llano."""
+    label    = _coin_label(symbol)
+    dry_note = "⚠️ [SIMULACIÓN - sin dinero real]\n\n" if DRY_RUN else ""
+    await _notify(bot,
+        f"{dry_note}"
+        f"😔 Hoy no ha podido ser. He tenido que vender {label} "
+        f"para proteger el dinero y hemos perdido {abs(pnl):.2f} dólares. "
+        f"Seguimos buscando la próxima.\n\n"
+        f"💰 Tu dinero total ahora mismo: {total_bal:.2f} USDC"
+    )
 
-    total_pnl     = total_cur - total_inv
-    total_pnl_pct = (total_pnl / total_inv * 100) if total_inv else 0
+async def _msg_kill_switch(bot: Bot, total_bal: float, drawdown: float):
+    """Aviso de kill switch en lenguaje llano."""
+    await _notify(bot,
+        f"🛑 He pausado todas las compras porque el dinero ha bajado "
+        f"un {drawdown:.1f}% hoy, que es más de lo que me has dicho que tolere.\n\n"
+        f"💰 Tu dinero total ahora mismo: {total_bal:.2f} USDC\n\n"
+        f"No haré nada hasta mañana que se reinicie el contador."
+    )
 
-    # Top ganador y perdedor
-    pnl_sorted = sorted(pnl_list, key=lambda x: x[1], reverse=True)
-    top_winner = pnl_sorted[0]  if pnl_sorted           else None
-    top_loser  = pnl_sorted[-1] if len(pnl_sorted) > 1  else None
+async def _msg_arranque(bot: Bot, total_bal: float, btc_ok: bool):
+    """Mensaje de arranque en lenguaje llano."""
+    dry_note = "⚠️ Estoy en modo SIMULACIÓN — no se mueve dinero real.\n\n" if DRY_RUN else ""
+    btc_msg  = "Bitcoin está estable hoy ✅" if btc_ok else "Bitcoin no está bien ahora ⛔"
+    await _notify(bot,
+        f"{dry_note}"
+        f"¡Hola! 👋 Acabo de arrancar y estoy listo para vigilar el mercado.\n\n"
+        f"Voy a estar pendiente de:\n"
+        f"  · TAO (Bittensor)\n"
+        f"  · Render\n"
+        f"  · Fetch.AI\n"
+        f"  · Solana\n\n"
+        f"Usaré 25 dólares por cada compra y no haré más de 3 a la vez.\n"
+        f"{btc_msg}\n\n"
+        f"💰 Tu dinero total ahora mismo: {total_bal:.2f} USDC"
+    )
 
-    # Datos globales
-    btc_dom   = global_data.get("btc_dominance", 0)
-    total_cap = global_data.get("total_cap_eur", 0)
-    cap_chg   = global_data.get("cap_change_24h", 0)
-
-    if btc_dom > 60:
-        market_mood = "🔵 Dominancia BTC alta — mercado defensivo/Bitcoin"
-    elif btc_dom > 50:
-        market_mood = "🟡 Dominancia BTC moderada — equilibrio BTC/altcoins"
-    else:
-        market_mood = "🟢 Dominancia BTC baja — posible temporada de altcoins"
-
-    lines = [f"📋 <b>INFORME MONITOR — {now_str}</b>", ""]
-
-    # ── Sección cartera ───────────────────────────────────────────────────────
-    if pnl_list:
-        lines += [
-            "━━━━━━━━━━━━━━━━━━━━━━━━",
-            f"{'🟢' if total_pnl >= 0 else '🔴'} <b>Balance de Cartera</b>",
-            f"  Invertido: {fp(total_inv)}",
-            f"  Valor actual: {fp(total_cur)}",
-            f"  P&amp;L: {fp(total_pnl)} ({total_pnl_pct:+.2f}%)",
-            "",
-        ]
-        if top_winner:
-            pos_w   = portfolio.get(top_winner[0], {})
-            inv_w   = pos_w.get("total_invertido_eur", 0)
-            cur_w   = top_winner[3]
-            pnl_w   = cur_w - inv_w
-            lines += [
-                f"🏆 <b>Top Ganador:</b> {sym(top_winner[0])} ({coin_name(top_winner[0])})",
-                f"  {fp(top_winner[2])} · Benef. Neto: {fp(pnl_w)} ({top_winner[1]:+.2f}%)",
-            ]
-        if top_loser and top_loser[0] != (top_winner[0] if top_winner else ""):
-            pos_l   = portfolio.get(top_loser[0], {})
-            inv_l   = pos_l.get("total_invertido_eur", 0)
-            cur_l   = top_loser[3]
-            pnl_l   = cur_l - inv_l
-            lines += [
-                f"📉 <b>Top Perdedor:</b> {sym(top_loser[0])} ({coin_name(top_loser[0])})",
-                f"  {fp(top_loser[2])} · Benef. Neto: {fp(pnl_l)} ({top_loser[1]:+.2f}%)",
-            ]
-        lines.append("")
-
-    # ── Sección mercado global ────────────────────────────────────────────────
-    lines += [
-        "━━━━━━━━━━━━━━━━━━━━━━━━",
-        "🌍 <b>Estado Global del Mercado</b>",
-        f"  Dominancia BTC: <b>{btc_dom}%</b>",
-        f"  Cap. total: {fv(total_cap)}",
-        f"  Variación 24h: {pc(cap_chg)}",
-        f"  {market_mood}",
-        "",
-    ]
-
-    # ── Sección resumen de alertas ────────────────────────────────────────────
-    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━")
-
-    n_gangas = n_radar + n_top50
-    if n_alerts_a == 0 and n_gangas == 0:
-        lines += [
-            "✅ <b>Sin señales de acción detectadas</b>",
-            "Cartera estable. No hay movimientos urgentes recomendados.",
-        ]
-    else:
-        if n_alerts_a > 0:
-            lines.append(
-                f"⚠️ <b>{n_alerts_a} alerta{'s' if n_alerts_a>1 else ''} de cartera</b> enviada{'s' if n_alerts_a>1 else ''}."
-            )
-        if n_radar > 0:
-            lines.append(
-                f"📡 <b>{n_radar} señal{'es' if n_radar>1 else ''} del Radar Fijo IA/DePIN.</b> "
-                f"Revisa las alertas de OPORTUNIDAD — TAO/RENDER/FET/ONDO/AKT."
-            )
-        if n_top50 > 0:
-            lines.append(
-                f"🔍 <b>{n_top50} señal{'es' if n_top50>1 else ''} del Aggressive Hunter (Top 51-150).</b> "
-                f"⚡ Zona volátil — RSI&lt;32 + caída &gt;10%."
-            )
-
-    lines.append(f"\n_Próximo análisis en {MONITOR_HOURS}h_")
-
-    try:
-        await bot.send_message(
-            chat_id    = CHAT_ID,
-            text       = "\n".join(lines),
-            parse_mode="HTML",
-        )
-    except Exception as e:
-        log.error("Error enviando reporte final: %s", e)
+async def _msg_error_grave(bot: Bot, motivo: str):
+    """Aviso de error grave en lenguaje llano."""
+    await _notify(bot,
+        f"⚠️ Ha ocurrido un problema técnico y no puedo operar ahora mismo.\n\n"
+        f"Motivo técnico (para tu información): {motivo}\n\n"
+        f"Lo seguiré intentando en el próximo ciclo."
+    )
 
 # ══════════════════════════════════════════════════════════════════════════════
-# COMANDOS
+# EJECUCIÓN DE ÓRDENES
 # ══════════════════════════════════════════════════════════════════════════════
-HELP = (
-    "👋 <b>Crypto Bot Pro v19 — Aggressive Hunter</b>\n\n"
-    "📦 <b>CARTERA (Coste Real)</b>\n"
-    "  /compra TAO 10 0.045 — Euros invertidos + tokens recibidos\n"
-    "  /compra TAO 10 — Bot calcula tokens al precio actual\n"
-    "  /venta TAO 0.02 — Registrar venta (P&amp;L real)\n"
-    "  /cartera — Cartera con break-even y coste real\n"
-    "  /precio BTC — Precio actual en €\n"
-    "  /buscar PEPE — Buscar cualquier cripto\n\n"
-    "📊 <b>ANÁLISIS</b>\n"
-    "  /analizar TAO — Análisis diario + 4h\n"
-    "  /analizar — Analizar toda tu cartera\n"
-    "  ⚠️ Aviso automático si moneda fuera del Top 50\n\n"
-    "🔍 <b>MERCADO</b>\n"
-    "  /mercado — Top 100 oportunidades en €\n\n"
-    "🔔 <b>MONITOR HORARIO (3 Fases)</b>\n"
-    "  /monitor — Estado del sistema\n"
-    "  /forzarmonitor — Ejecutar ahora\n\n"
-    "📡 <b>Radar Fijo:</b> TAO · RENDER · FET · ONDO · AKT\n"
-    "  ↳ Alerta si caída &gt;10% o RSI&lt;32\n"
-    "🔍 <b>Aggressive Hunter:</b> Top 51-150 por volumen\n"
-    "  ↳ Alerta si caída &gt;10% y RSI&lt;32\n\n"
-    "⚙️ /cancelar — Parar comando en curso\n\n"
-    "<i>Precios en euros · Monitor cada 1h</i>\n"
-    "<i>Fase A: Cartera · Fase B: Radar · Fase C: Hunter</i>"
-)
-
-async def cmd_start(u, c): await u.message.reply_text(HELP, parse_mode="HTML")
-async def cmd_ayuda(u, c): await u.message.reply_text(HELP, parse_mode="HTML")
-
-async def cmd_cartera(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    p = state["portfolio"]
-    if not p:
-        await update.message.reply_text(
-            "Tu cartera está vacía.\n\n"
-            "Usa <code>/compra TAO 10 0.045</code> para añadir\n"
-            "  (euros invertidos · tokens recibidos)\n"
-            "o /mercado para buscar oportunidades.",
-            parse_mode="HTML")
-        return
-    msg  = await update.message.reply_text("🔄 Obteniendo precios en €...")
-    data = await run(_fetch_prices, list(p.keys()))
-    ti = tc = 0   # total invertido, total en cartera
-    lines = [f"💼 <b>Tu Cartera v19 — Coste Real</b> ({CURRENCY_SYM})\n"]
-    for cid, pos in p.items():
-        tokens   = pos["cantidad_tokens"]
-        inv_eur  = pos["total_invertido_eur"]
-        info     = data.get(cid, {})
-        price    = info.get(CURRENCY, 0)
-        chg24    = info.get(f"{CURRENCY}_24h_change", 0) or 0
-        cur_val  = price * tokens
-        ben_net  = cur_val - inv_eur
-        ben_pct  = (ben_net / inv_eur * 100) if inv_eur else 0
-        be_price = (inv_eur / tokens) if tokens else 0
-        ti += inv_eur
-        tc += cur_val
-        trailing_sl, _ = calc_trailing_stop(inv_eur, tokens, price)
-        trailing_line  = f"  🔒 Trailing stop: {fp(trailing_sl)}\n" if trailing_sl else ""
-        lines.append(
-            f"{'🟢' if ben_net>=0 else '🔴'} <b>{sym(cid)}</b>\n"
-            f"  Tokens: <code>{tokens}</code> · Invertido real: <code>{fp(inv_eur)}</code>\n"
-            f"  Break-even: <code>{fp(be_price)}</code> · Ahora: <code>{fp(price)}</code>\n"
-            f"  24h: {pc(chg24)}\n"
-            f"  Valor actual: {fp(cur_val)} · Benef. Neto: {fp(ben_net)} ({ben_pct:+.2f}%)\n"
-            + trailing_line
-        )
-    tp   = tc - ti
-    tpct = (tp / ti * 100) if ti else 0
-    lines += [
-        "━━━━━━━━━━━━━━━━",
-        f"{'🟢' if tp>=0 else '🔴'} <b>RESUMEN TOTAL</b>",
-        f"  💶 Dinero real invertido: <code>{fp(ti)}</code>",
-        f"  📊 Valor actual en mercado: <code>{fp(tc)}</code>",
-        f"  {'💰' if tp>=0 else '📉'} Beneficio Neto Real: <code>{fp(tp)}</code> ({tpct:+.2f}%)",
-        f"\n_🕐 {datetime.now().strftime('%H:%M:%S')}_",
-    ]
-    await msg.edit_text("\n".join(lines), parse_mode="HTML")
-
-async def cmd_compra(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+def _execute_buy(symbol: str, usdc_amount: float) -> dict:
     """
-    Uso: /compra TAO 10 0.045
-         /compra TAO 10       ← el bot calcula los tokens al precio actual
-
-    Parámetros:
-      arg1 = símbolo / nombre de la moneda
-      arg2 = euros_invertidos  (dinero real que salió de tu cuenta)
-      arg3 = cantidad_tokens   (tokens recibidos tras comisiones, opcional)
+    Compra MARKET en OKX SPOT pagando `usdc_amount` USDC.
+    tdMode='cash' es obligatorio para órdenes Spot en OKX.
     """
-    args = ctx.args
-    if len(args) < 2:
-        await update.message.reply_text(
-            f"<b>Uso:</b>\n"
-            f"<code>/compra TAO 10 0.045</code>\n"
-            f"  ↳ 10€ invertidos · 0.045 TAO recibidos\n\n"
-            f"<code>/compra TAO 10</code>\n"
-            f"  ↳ 10€ invertidos · tokens calculados al precio actual\n\n"
-            f"<i>El segundo parámetro es el dinero REAL que salió de tu cuenta (incluye comisiones).</i>\n"
-            f"<i>El tercero son los tokens que REALMENTE recibiste tras comisiones.</i>",
-            parse_mode="HTML")
-        return
+    ex     = get_exchange()
+    market = ex.markets.get(symbol, {})
+    price  = _fetch_price(symbol)
+    if price <= 0:
+        raise ValueError(f"Precio inválido para {symbol}")
 
-    coin_id = resolve_coin(args[0])
-    if not coin_id:
-        await update.message.reply_text(f"❌ No reconozco '{args[0]}'. Prueba /buscar {args[0]}")
-        return
+    lot_step = (
+        market.get("precision", {}).get("amount")
+        or (market.get("limits") or {}).get("amount", {}).get("min", 0.0001)
+        or 0.0001
+    )
+    quantity = _round_step(usdc_amount / price, lot_step)
+    min_qty  = ((market.get("limits") or {}).get("amount") or {}).get("min") or 0.0
+    if quantity < min_qty:
+        quantity = _round_step(min_qty * 1.05, lot_step)
 
-    try:
-        euros_invertidos = float(args[1].replace(",", "."))
-        if euros_invertidos <= 0: raise ValueError
-    except ValueError:
-        await update.message.reply_text("❌ Los euros invertidos deben ser un número positivo.")
-        return
-
-    # Obtener precio actual siempre (para mostrar contexto aunque se den tokens manuales)
-    msg_tmp  = await update.message.reply_text("🔄 Obteniendo precio de mercado en €...")
-    info     = await run(_fetch_prices, [coin_id])
-    price_now = info[coin_id].get(CURRENCY, 0) if (info and coin_id in info) else 0
-
-    if len(args) >= 3:
+    if DRY_RUN:
+        order_id   = f"DRY-BUY-{int(time.time())}"
+        exec_price = price
+        log.info("[DRY RUN] BUY %s qty=%.8f @ %.6f USDC", symbol, quantity, price)
+    else:
         try:
-            tokens_recibidos = float(args[2].replace(",", "."))
-            if tokens_recibidos <= 0: raise ValueError
-        except ValueError:
-            await msg_tmp.edit_text("❌ La cantidad de tokens debe ser un número positivo.")
-            return
-        await msg_tmp.delete()
-    else:
-        # Calcular tokens al precio de mercado actual (sin comisiones implícitas)
-        if not price_now:
-            await msg_tmp.edit_text(
-                f"⚠️ No pude obtener el precio de <b>{sym(coin_id)}</b>.\n"
-                f"Indícalo manualmente: <code>/compra {sym(coin_id)} {euros_invertidos} &lt;tokens_recibidos&gt;</code>",
-                parse_mode="HTML")
-            return
-        tokens_recibidos = round(euros_invertidos / price_now, 8)
-        await msg_tmp.delete()
-
-    p = state["portfolio"]
-    if coin_id in p:
-        # DCA: sumar inversión y tokens
-        p[coin_id]["total_invertido_eur"] = round(p[coin_id]["total_invertido_eur"] + euros_invertidos, 4)
-        p[coin_id]["cantidad_tokens"]     = round(p[coin_id]["cantidad_tokens"] + tokens_recibidos, 8)
-        extra = "📈 Posición ampliada (DCA)."
-    else:
-        p[coin_id] = {
-            "total_invertido_eur": round(euros_invertidos, 4),
-            "cantidad_tokens":     round(tokens_recibidos, 8),
-        }
-        extra = "🆕 Nueva posición creada."
-
-    save_state()
-    be_price = round(p[coin_id]["total_invertido_eur"] / p[coin_id]["cantidad_tokens"], 8)
-    await update.message.reply_text(
-        f"✅ <b>Compra registrada — v19 Coste Real</b>\n\n"
-        f"  <b>{sym(coin_id)}</b> — {tokens_recibidos} tokens\n"
-        f"  💶 Dinero real invertido: <code>{fp(euros_invertidos)}</code>\n"
-        f"  📊 Precio de mercado ahora: <code>{fp(price_now)}</code>\n\n"
-        f"  <b>Posición total:</b>\n"
-        f"  Tokens acumulados: <code>{p[coin_id]['cantidad_tokens']}</code>\n"
-        f"  Total invertido: <code>{fp(p[coin_id]['total_invertido_eur'])}</code>\n"
-        f"  Break-even exacto: <code>{fp(be_price)}</code> por token\n\n"
-        f"<i>{extra}</i>",
-        parse_mode="HTML")
-
-async def cmd_venta(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    args = ctx.args
-    if len(args) < 2:
-        await update.message.reply_text(
-            "Uso: <code>/venta TAO 0.02</code> — número de tokens a vender", parse_mode="HTML")
-        return
-    coin_id = resolve_coin(args[0])
-    if not coin_id:
-        await update.message.reply_text(f"❌ No reconozco '{args[0]}'.")
-        return
-    try:
-        tokens_venta = float(args[1].replace(",", "."))
-        if tokens_venta <= 0: raise ValueError
-    except ValueError:
-        await update.message.reply_text("❌ La cantidad debe ser un número positivo.")
-        return
-    p = state["portfolio"]
-    if coin_id not in p:
-        await update.message.reply_text(
-            f"⚠️ No tienes <b>{sym(coin_id)}</b> en cartera.", parse_mode="HTML")
-        return
-
-    pos          = p[coin_id]
-    tokens_total = pos["cantidad_tokens"]
-    inv_total    = pos["total_invertido_eur"]
-
-    info  = await run(_fetch_prices, [coin_id])
-    price = info.get(coin_id, {}).get(CURRENCY, 0) if info else 0
-
-    # Proporción vendida para calcular el coste real vendido
-    ratio          = min(tokens_venta / tokens_total, 1.0)
-    inv_vendido    = inv_total * ratio          # euros reales que corresponden a esta venta
-    valor_venta    = price * tokens_venta       # euros que recibes ahora
-    ben_neto_venta = valor_venta - inv_vendido  # beneficio neto de esta venta
-    ben_pct_venta  = (ben_neto_venta / inv_vendido * 100) if inv_vendido else 0
-
-    if tokens_venta >= tokens_total:
-        del p[coin_id]
-        remaining = 0
-        remaining_inv = 0.0
-    else:
-        p[coin_id]["cantidad_tokens"]     = round(tokens_total - tokens_venta, 8)
-        p[coin_id]["total_invertido_eur"] = round(inv_total - inv_vendido, 4)
-        remaining     = p[coin_id]["cantidad_tokens"]
-        remaining_inv = p[coin_id]["total_invertido_eur"]
-
-    save_state()
-    await update.message.reply_text(
-        f"{'💰' if ben_neto_venta>=0 else '📉'} <b>Venta registrada — v19 Coste Real</b>\n\n"
-        f"  <b>{sym(coin_id)}</b> — {tokens_venta} tokens @ {fp(price)}\n"
-        f"  💶 Coste real vendido: <code>{fp(inv_vendido)}</code>\n"
-        f"  📊 Valor de venta: <code>{fp(valor_venta)}</code>\n"
-        f"  Beneficio Neto Real: <code>{fp(ben_neto_venta)}</code> ({ben_pct_venta:+.2f}%)\n\n"
-        f"  Tokens restantes: <code>{remaining}</code>\n"
-        f"  Invertido restante: <code>{fp(remaining_inv)}</code>",
-        parse_mode="HTML")
-
-async def cmd_precio(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not ctx.args:
-        await update.message.reply_text("Uso: <code>/precio BTC</code>", parse_mode="HTML")
-        return
-    coin_id = resolve_coin(ctx.args[0])
-    if not coin_id:
-        await update.message.reply_text(
-            f"❌ No reconozco '{ctx.args[0]}'. Prueba /buscar {ctx.args[0]}")
-        return
-    msg  = await update.message.reply_text("🔄 Obteniendo precio en €...")
-    info = await run(_fetch_prices, [coin_id])
-    if not info or coin_id not in info:
-        await msg.edit_text(
-            "⚠️ No pude obtener el precio ahora mismo. Espera 30s e inténtalo de nuevo.")
-        return
-    d = info[coin_id]
-    await msg.edit_text(
-        f"💰 <b>{sym(coin_id)} — {coin_name(coin_id)}</b>\n\n"
-        f"  Precio: <b>{fp(d.get(CURRENCY, 0))}</b>\n"
-        f"  24h: {pc(d.get(f'{CURRENCY}_24h_change', 0) or 0)}\n"
-        f"  7d:  {pc(d.get(f'{CURRENCY}_7d_change',  0) or 0)}\n"
-        f"  Vol 24h: {fv(d.get(f'{CURRENCY}_24h_vol', 0) or 0)}\n"
-        f"  Mkt cap: {fv(d.get(f'{CURRENCY}_market_cap', 0) or 0)}",
-        parse_mode="HTML")
-
-async def cmd_buscar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not ctx.args:
-        await update.message.reply_text("Uso: <code>/buscar PEPE</code>", parse_mode="HTML")
-        return
-    query   = " ".join(ctx.args)
-    msg     = await update.message.reply_text(f"🔍 Buscando '{query}'...")
-    coin_id = await run(resolve_coin, query)
-    if not coin_id:
-        await msg.edit_text(f"❌ No encontré ninguna cripto con '{query}'.")
-        return
-    info = await run(_fetch_prices, [coin_id])
-    if not info or coin_id not in info:
-        await msg.edit_text(
-            f"✅ Encontrada: <b>{coin_name(coin_id)}</b> ({sym(coin_id)})\n"
-            f"⚠️ Sin datos de precio disponibles.", parse_mode="HTML")
-        return
-    d  = info[coin_id]
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton(f"📊 Analizar {sym(coin_id)}", callback_data=f"analyse:{coin_id}"),
-        InlineKeyboardButton("📥 Registrar compra",         callback_data=f"buy_prompt:{coin_id}"),
-    ]])
-    await msg.edit_text(
-        f"✅ <b>{coin_name(coin_id)}</b> ({sym(coin_id)})\n\n"
-        f"  Precio: <b>{fp(d.get(CURRENCY, 0))}</b>\n"
-        f"  24h: {pc(d.get(f'{CURRENCY}_24h_change', 0) or 0)}\n"
-        f"  7d:  {pc(d.get(f'{CURRENCY}_7d_change',  0) or 0)}\n"
-        f"  Vol 24h: {fv(d.get(f'{CURRENCY}_24h_vol', 0) or 0)}\n"
-        f"  Mkt cap: {fv(d.get(f'{CURRENCY}_market_cap', 0) or 0)}",
-        parse_mode="HTML", reply_markup=kb)
-
-async def cmd_analizar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    p = state["portfolio"]
-    if ctx.args:
-        coin_id = resolve_coin(ctx.args[0])
-        if not coin_id:
-            await update.message.reply_text(
-                f"❌ No reconozco '{ctx.args[0]}'. Prueba /buscar {ctx.args[0]}")
-            return
-        msg  = await update.message.reply_text(
-            f"🔍 Analizando <b>{sym(coin_id)}</b>...", parse_mode="HTML")
-        info = await run(_fetch_prices, [coin_id])
-        if not info or coin_id not in info:
-            await msg.edit_text(
-                "⚠️ No pude obtener datos ahora. Espera 30s e inténtalo de nuevo.")
-            return
-        a = await run(_do_full_analysis, coin_id, info[coin_id])
-        # ── Aviso sector volátil si la moneda está fuera del Top 50 ──────────
-        volatile_warn = ""
-        if TOP_IDS and coin_id not in TOP_IDS[:50]:
-            volatile_warn = (
-                "\n\n⚠️ <b>SECTOR VOLÁTIL:</b> Moneda de rango medio-bajo "
-                "(fuera del Top 50 por capitalización). "
-                "Mayor potencial de rebote, mayor riesgo de liquidez."
+            order = ex.createMarketBuyOrderWithCost(
+                symbol, usdc_amount,
+                params={"tdMode": "cash"}
             )
-        await msg.edit_text(
-            build_analysis_msg(coin_id, a, holding=p.get(coin_id)) + volatile_warn,
-            parse_mode="HTML")
+        except (ccxt.NotSupported, AttributeError):
+            order = ex.create_market_buy_order(
+                symbol, quantity,
+                params={"tdMode": "cash"}
+            )
+        order_id   = str(order.get("id", ""))
+        exec_price = float(order.get("average") or order.get("price") or price)
+        quantity   = float(order.get("filled") or order.get("amount") or quantity)
+        log.info("BUY OKX: %s id=%s qty=%.8f @ %.6f", symbol, order_id, quantity, exec_price)
+
+    return {
+        "symbol":      symbol,
+        "entry_price": exec_price,
+        "quantity":    quantity,
+        "invested":    round(quantity * exec_price, 4),
+        "peak_price":  exec_price,
+        "entry_time":  datetime.now(timezone.utc).isoformat(),
+        "order_id":    order_id,
+    }
+
+def _execute_sell(symbol: str, quantity: float) -> dict:
+    """Venta MARKET en OKX SPOT con tdMode='cash'."""
+    ex = get_exchange()
+    if DRY_RUN:
+        price    = _fetch_price(symbol)
+        order_id = f"DRY-SELL-{int(time.time())}"
+        log.info("[DRY RUN] SELL %s qty=%.8f @ %.6f USDC", symbol, quantity, price)
+    else:
+        order    = ex.create_market_sell_order(
+            symbol, quantity,
+            params={"tdMode": "cash"}
+        )
+        order_id = str(order.get("id", ""))
+        exec_p   = order.get("average") or order.get("price")
+        price    = float(exec_p) if exec_p else _fetch_price(symbol)
+        log.info("SELL OKX: %s id=%s qty=%.8f @ %.6f", symbol, order_id, quantity, price)
+
+    return {
+        "price":    price,
+        "proceeds": round(price * quantity, 4),
+        "order_id": order_id,
+    }
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GESTIÓN DE CAPITAL Y RIESGO
+# ══════════════════════════════════════════════════════════════════════════════
+def _slots_available() -> int:
+    return MAX_POSITIONS - len(state["positions"])
+
+def _reset_daily_if_needed(total: float):
+    today = date.today().isoformat()
+    if state.get("daily_date") != today:
+        state["daily_date"]         = today
+        state["daily_start_bal"]    = total
+        state["daily_realized_pnl"] = 0.0
+        state["trades_today"]       = 0
+        log.info("Reset diario — saldo inicial: %.2f USDC", total)
+        save_state()
+
+def _check_kill_switch(total: float) -> tuple[bool, float]:
+    """Devuelve (activado, drawdown_pct)."""
+    if state["kill_switch"]:
+        return True, 0.0
+    start = state.get("daily_start_bal") or 0.0
+    if start <= 0:
+        return False, 0.0
+    dd = (start - total) / start * 100.0
+    if dd >= KILL_SWITCH_PCT:
+        state["kill_switch"]        = True
+        state["kill_switch_reason"] = f"Drawdown {dd:.2f}% > {KILL_SWITCH_PCT}%"
+        save_state()
+        log.warning("⛔ KILL SWITCH: drawdown %.2f%%", dd)
+        return True, dd
+    return False, dd
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ANÁLISIS
+# ══════════════════════════════════════════════════════════════════════════════
+async def _analyze(symbol: str) -> Optional[dict]:
+    """Descarga velas 15m y calcula indicadores. Devuelve None si falla."""
+    try:
+        closes = await _async(_fetch_ohlcv_closes, symbol, "15m", OHLCV_LIMIT)
+        if len(closes) < 35:
+            return None
+        return {
+            "rsi":     _rsi(closes),
+            "bullish": _macd_turning_bullish(closes),
+            "price":   closes[-1],
+        }
+    except Exception as e:
+        log.debug("Error analizando %s: %s", symbol, e)
+        return None
+
+# ══════════════════════════════════════════════════════════════════════════════
+# OPERACIONES CON NOTIFICACIÓN LLANA
+# ══════════════════════════════════════════════════════════════════════════════
+async def _buy(symbol: str, bot: Bot) -> bool:
+    """Ejecuta la compra y envía mensaje amigable por Telegram."""
+    if symbol in state["positions"] or _slots_available() <= 0:
+        return False
+
+    try:
+        free = await _async(_fetch_usdc_free)
+    except Exception as e:
+        log.error("Error obteniendo USDC libre: %s", e)
+        return False
+
+    amount = min(TRADE_USDC, free * 0.98)
+    if amount < MIN_TRADE_USDC:
+        log.warning("USDC insuficiente para %s (%.2f disponible)", symbol, free)
+        return False
+
+    try:
+        result = await _async(_execute_buy, symbol, amount)
+    except Exception as e:
+        log.error("Fallo comprando %s: %s", symbol, e)
+        await _msg_error_grave(bot, f"No pude comprar {_coin_label(symbol)}: {e}")
+        return False
+
+    state["positions"][symbol] = result
+    state["trades_today"]      = state.get("trades_today", 0) + 1
+    save_state()
+
+    try:
+        total_bal = await _async(_fetch_total_portfolio_usdc)
+    except Exception:
+        total_bal = 0.0
+
+    await _msg_compra(bot, symbol, result["invested"], result["entry_price"], total_bal)
+    log.info("COMPRA: %s %.2f USDC @ %.6f", symbol, result["invested"], result["entry_price"])
+    return True
+
+async def _sell(symbol: str, pos: dict, bot: Bot):
+    """Ejecuta la venta y envía el mensaje amigable correspondiente."""
+    try:
+        result = await _async(_execute_sell, symbol, pos["quantity"])
+    except Exception as e:
+        log.error("Fallo vendiendo %s: %s", symbol, e)
+        await _msg_error_grave(bot, f"No pude vender {_coin_label(symbol)}: {e}")
         return
-    if not p:
-        await update.message.reply_text(
-            "Tu cartera está vacía.\n\nUsa /compra BTC 0.5 para añadir\n"
-            "o /mercado para buscar oportunidades.")
+
+    invested = pos["invested"]
+    proceeds = result["proceeds"]
+    pnl      = proceeds - invested
+
+    state["positions"].pop(symbol, None)
+    state["daily_realized_pnl"] = round(
+        state.get("daily_realized_pnl", 0.0) + pnl, 4
+    )
+    save_state()
+
+    try:
+        total_bal = await _async(_fetch_total_portfolio_usdc)
+    except Exception:
+        total_bal = 0.0
+
+    if pnl >= 0:
+        await _msg_venta_ganancia(bot, symbol, pnl, total_bal)
+    else:
+        await _msg_venta_perdida(bot, symbol, pnl, total_bal)
+
+    log.info("VENTA: %s P&L %+.2f USDC", symbol, pnl)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BUCLE DE TRADING — cada 15 minutos
+# ══════════════════════════════════════════════════════════════════════════════
+async def trading_loop(bot: Bot):
+    """
+    1. Comprobar saldo y kill switch
+    2. Filtro BTC (protector)
+    3. Analizar cada moneda del WATCHLIST
+    4. Comprar si RSI < 32 + MACD alcista
+    """
+    now = datetime.now(timezone.utc)
+    log.info("━━━ CICLO %s ━━━", now.strftime("%d/%m %H:%M"))
+    state["last_scan"] = now.isoformat()
+
+    # ── Saldo total ───────────────────────────────────────────────────────────
+    try:
+        total = await _async(_fetch_total_portfolio_usdc)
+    except Exception as e:
+        log.error("Error obteniendo portfolio: %s", e)
         return
-    n   = len(p)
-    msg = await update.message.reply_text(
-        f"🔍 Analizando {n} activo{'s' if n>1 else ''} de tu cartera...\n"
-        f"<i>Escribe /cancelar para parar.</i>",
-        parse_mode="HTML")
-    data = await run(_fetch_prices, list(p.keys()))
-    for cid, pos in p.items():
-        if state.get("cancel"):
-            state["cancel"] = False
-            await msg.edit_text("🛑 Análisis cancelado.")
-            return
-        info = data.get(cid)
-        if not info:
-            await update.message.reply_text(f"⚠️ Sin datos para {sym(cid)}, saltando.")
+
+    _reset_daily_if_needed(total)
+
+    killed, dd = _check_kill_switch(total)
+    if killed:
+        if dd > 0:
+            await _msg_kill_switch(bot, total, dd)
+        log.warning("Kill switch activo — ciclo omitido")
+        return
+
+    if _slots_available() <= 0:
+        log.info("Posiciones llenas (%d/%d)", len(state["positions"]), MAX_POSITIONS)
+        return
+
+    # ── Filtro BTC ────────────────────────────────────────────────────────────
+    try:
+        btc_chg = await _async(_fetch_btc_1h_change)
+        btc_ok  = btc_chg > -BTC_DROP_BLOCK
+        log.info("BTC 1h: %+.2f%% — %s", btc_chg, "OK" if btc_ok else "BLOQUEADO")
+    except Exception as e:
+        log.warning("Error filtro BTC: %s", e)
+        btc_ok = True   # si no podemos saber, seguimos (conservador)
+
+    if not btc_ok:
+        log.info("Filtro BTC: compras pausadas (BTC %.2f%%)", btc_chg)
+        return
+
+    # ── Analizar WATCHLIST ────────────────────────────────────────────────────
+    for symbol in WATCHLIST:
+        if _slots_available() <= 0:
+            break
+        if symbol in state["positions"]:
             continue
-        await msg.edit_text(f"🔍 Analizando <b>{sym(cid)}</b>...", parse_mode="HTML")
-        a = await run(_do_full_analysis, cid, info)
-        await update.message.reply_text(
-            build_analysis_msg(cid, a, holding=pos), parse_mode="HTML")
-    await msg.edit_text(
-        f"✅ Análisis completado — {n} activo{'s' if n>1 else ''}.\n"
-        f"<i>🕐 {datetime.now().strftime('%H:%M')}</i>",
-        parse_mode="HTML")
 
-async def cmd_mercado(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    msg = await update.message.reply_text(
-        f"🔍 <b>Analizando el top 100 del mercado en {CURRENCY_SYM}...</b>\n_~30 segundos._",
-        parse_mode="HTML")
-    markets = await run(_fetch_top_markets)
-    if not markets:
-        await msg.edit_text(
-            "⚠️ No pude obtener datos ahora mismo.\n"
-            "CoinGecko puede estar limitando peticiones. Espera 30s e intenta de nuevo.")
+        a = await _analyze(symbol)
+        await asyncio.sleep(0.5)   # cortesía con el rate limit de OKX
+
+        if not a:
+            log.debug("%s — sin datos suficientes", symbol)
+            continue
+
+        log.info("%s RSI=%.1f MACD_bull=%s", symbol, a["rsi"], a["bullish"])
+
+        if a["rsi"] < RSI_BUY and a["bullish"]:
+            log.info("Señal de compra: %s", symbol)
+            await _buy(symbol, bot)
+            await asyncio.sleep(1.0)
+
+    log.info("━━━ FIN CICLO — posiciones: %d/%d ━━━",
+             len(state["positions"]), MAX_POSITIONS)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BUCLE DE RIESGO — cada 60 segundos
+# ══════════════════════════════════════════════════════════════════════════════
+async def risk_loop(bot: Bot):
+    """Vigila SL y TP de todas las posiciones abiertas."""
+    if not state["positions"]:
         return
-    scored = []
-    for c in markets:
-        price = c.get("current_price", 0) or 0
-        chg24 = c.get("price_change_percentage_24h", 0) or 0
-        chg7  = c.get("price_change_percentage_7d_in_currency", 0) or 0
-        vol   = c.get("total_volume", 0) or 0
-        mcap  = c.get("market_cap", 0) or 0
-        cid   = c.get("id", "")
-        sym_c = c.get("symbol", "").upper()
-        name  = c.get("name", "")
-        if not price: continue
-        if cid and cid not in CATALOGUE:
-            CATALOGUE[cid] = {"symbol": sym_c, "name": name}
-        score = 0
-        if chg24 < -8:   score += 2
-        elif chg24 < -3: score += 1
-        elif chg24 > 10: score -= 2
-        elif chg24 > 5:  score -= 1
-        if chg7 < -15:   score += 2
-        elif chg7 < -5:  score += 1
-        elif chg7 > 20:  score -= 2
-        if mcap > 0 and vol/mcap > 0.15: score += 1
-        scored.append({"id": cid, "symbol": sym_c, "name": name,
-                        "price": price, "chg24": chg24, "chg7": chg7,
-                        "vol": vol, "mcap": mcap, "score": score})
-    scored.sort(key=lambda x: x["score"], reverse=True)
-    buy_list = [x for x in scored if x["score"] >= 1]
-    avoid    = [x for x in scored if x["score"] <= -2]
-    lines    = [f"🔍 <b>Scanner de Mercado — {datetime.now().strftime('%H:%M')}</b> ({CURRENCY_SYM})\n"]
-    if buy_list:
-        lines.append("🟢 <b>POSIBLES OPORTUNIDADES DE COMPRA</b>\n")
-        for x in buy_list[:10]:
-            tag = " 📦" if x["id"] in state["portfolio"] else ""
-            lines.append(
-                f"  <b>{x['symbol']}{tag}</b> — {fp(x['price'])}\n"
-                f"    24h: {pc(x['chg24'])}  7d: {pc(x['chg7'])}\n"
-                f"    Vol: {fv(x['vol'])}  MCap: {fv(x['mcap'])}\n")
-    if avoid:
-        lines.append("🔴 <b>PRECAUCIÓN</b> (subidas fuertes)\n")
-        for x in avoid[:5]:
-            tag = " 📦" if x["id"] in state["portfolio"] else ""
-            lines.append(f"  <b>{x['symbol']}{tag}</b> — {fp(x['price'])} — 24h: {pc(x['chg24'])}")
-    lines += [
-        "",
-        "💡 Análisis completo: <code>/analizar BTC</code>",
-        "<i>📦 = ya tienes en cartera</i>",
-        f"<i>Escaneadas: {len(scored)} monedas</i>",
-    ]
-    await msg.edit_text("\n".join(lines), parse_mode="HTML")
 
-async def cmd_monitor(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    watchlist_names = " · ".join(WATCHLIST.values())
-    last = state.get("last_monitor") or "Todavía no ejecutado"
-    await update.message.reply_text(
-        f"🔔 <b>Monitor Horario v19 — Aggressive Hunter</b>\n\n"
-        f"  Frecuencia: cada <b>{MONITOR_HOURS}h</b> ⚡\n"
-        f"  Último ciclo: <code>{last}</code>\n"
-        f"  Activos en cartera: <code>{len(state['portfolio'])}</code>\n"
-        f"  Moneda: <b>{CURRENCY_SYM} (euros)</b>\n\n"
-        f"<b>Fase A — Cartera (Coste Real):</b>\n"
-        f"  · 🚨 Señal de venta + Beneficio Neto Real\n"
-        f"  · ⚠️ Aviso break-even si posición en negativo\n"
-        f"  · 💡 DCA (caída ≥{DCA_DROP_PCT:.0f}% break-even + RSI&lt;35)\n"
-        f"  · 🔒 Trailing stop (beneficio ≥{TRAILING_MIN_PROFIT:.0f}%)\n"
-        f"  · ⚡ Volatilidad ≥{VOLATILITY_PCT:.0f}% en 1h\n"
-        f"  · 💰 Objetivo beneficio ≥{PROFIT_ALERT:.0f}%\n"
-        f"  · 🛑 Stop-loss cercano\n\n"
-        f"<b>Fase B — 📡 Radar Fijo IA/DePIN:</b>\n"
-        f"  · Monedas: {watchlist_names}\n"
-        f"  · Umbral agresivo: caída &gt;<b>{RADAR_DROP_24H:.0f}%</b> O RSI&lt;<b>{RADAR_RSI_MAX}</b>\n"
-        f"  · Score mínimo: {RADAR_SCORE_MIN}\n\n"
-        f"<b>Fase C — 🔍 Aggressive Hunter (Top 51-150 volumen):</b>\n"
-        f"  · Zona de alta volatilidad — más rebotes intradía\n"
-        f"  · Umbral agresivo: caída &gt;<b>{HUNTER_DROP_24H:.0f}%</b> Y RSI&lt;<b>{HUNTER_RSI_MAX}</b>\n"
-        f"  · Score mínimo: {HUNTER_SCORE_MIN}\n"
-        f"  · Excluye cartera y Watchlist\n\n"
-        f"Usa /forzarmonitor para ejecutar ahora.",
-        parse_mode="HTML")
+    for symbol, pos in list(state["positions"].items()):
+        try:
+            price = await _async(_fetch_price, symbol)
+            if price <= 0:
+                continue
 
-async def cmd_forzar_monitor(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        f"🔄 <b>Ejecutando monitor v19 (3 fases)...</b>\n\n"
-        f"  <i>Fase A: {len(state['portfolio'])} activos en cartera</i>\n"
-        f"  <i>Fase B: Radar Fijo — TAO · RENDER · FET · ONDO · AKT</i>\n"
-        f"  <i>Fase C: Aggressive Hunter — Top 51-150 por volumen</i>\n\n"
-        f"<i>Recibirás el informe completo en unos minutos.</i>",
-        parse_mode="HTML")
-    await do_monitor(ctx.bot)
+            entry   = pos["entry_price"]
+            pnl_pct = (price - entry) / entry * 100.0
 
-async def cmd_cancelar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    state["cancel"] = True
-    await update.message.reply_text("🛑 Cancelando en el siguiente paso...")
+            if price > pos.get("peak_price", entry):
+                state["positions"][symbol]["peak_price"] = price
 
-async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    if q.data.startswith("buy_prompt:"):
-        cid = q.data.split(":")[1]
-        await q.message.reply_text(
-            f"Para registrar la compra de <b>{sym(cid)}</b>:\n\n"
-            f"<code>/compra {sym(cid)} &lt;cantidad&gt;</code>",
-            parse_mode="HTML")
-    elif q.data.startswith("analyse:"):
-        cid  = q.data.split(":")[1]
-        msg  = await q.message.reply_text(f"🔍 Analizando {sym(cid)}...")
-        info = await run(_fetch_prices, [cid])
-        if not info or cid not in info:
-            await msg.edit_text("⚠️ No pude obtener datos ahora mismo.")
-            return
-        a = await run(_do_full_analysis, cid, info[cid])
-        await msg.edit_text(
-            build_analysis_msg(cid, a, holding=state["portfolio"].get(cid)),
-            parse_mode="HTML")
+            if pnl_pct <= -STOP_LOSS_PCT:
+                log.warning("SL: %s %.2f%%", symbol, pnl_pct)
+                await _sell(symbol, pos, bot)
 
-async def unknown_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "No entiendo ese mensaje. Usa /ayuda para ver los comandos disponibles.")
+            elif pnl_pct >= TAKE_PROFIT_PCT:
+                log.info("TP: %s +%.2f%%", symbol, pnl_pct)
+                await _sell(symbol, pos, bot)
+
+        except Exception as e:
+            log.error("Error risk_loop %s: %s", symbol, e)
+
+    save_state()
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MAIN
+# ORQUESTADOR
 # ══════════════════════════════════════════════════════════════════════════════
-async def startup(app):
-    log.info("Cargando catálogo en background...")
-    await run(_fetch_catalogue)
-    await run(_fetch_top_ids)
-    log.info("Catálogo listo — %d monedas", len(CATALOGUE))
-    asyncio.create_task(monitor_loop(app))
+async def _run_trading_loop(bot: Bot):
+    await asyncio.sleep(15)
+    log.info("Trading loop activo — cada %d min", TRADE_LOOP_SEC // 60)
+    while True:
+        try:
+            await trading_loop(bot)
+        except Exception as e:
+            log.error("Error crítico en trading_loop: %s", e)
+            await _msg_error_grave(bot, str(e))
+        await asyncio.sleep(TRADE_LOOP_SEC)
 
-def main():
+async def _run_risk_loop(bot: Bot):
+    await asyncio.sleep(30)
+    log.info("Risk loop activo — cada %ds", RISK_LOOP_SEC)
+    while True:
+        try:
+            await risk_loop(bot)
+        except Exception as e:
+            log.error("Error crítico en risk_loop: %s", e)
+        await asyncio.sleep(RISK_LOOP_SEC)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ARRANQUE
+# ══════════════════════════════════════════════════════════════════════════════
+async def main():
+    """
+    Punto de entrada principal.
+    Verifica OKX en 3 pasos, arranca los bucles y envía el mensaje de bienvenida.
+    """
     if not TELEGRAM_TOKEN:
         raise RuntimeError("TELEGRAM_TOKEN no configurado")
 
+    log.info("════ INICIANDO BOT v20.2.2 — OKX USDC WATCHER ════")
+
+    # Construir el objeto Bot de Telegram (sin Application — no necesitamos comandos)
+    bot = Bot(token=TELEGRAM_TOKEN)
+
+    # ── Verificación OKX ──────────────────────────────────────────────────────
+    total_bal = 0.0
+    btc_ok    = True
+    connected = False
+
+    try:
+        ex = get_exchange()
+
+        log.info("[1/3] Cargando mercados OKX...")
+        await _async(ex.load_markets)
+        log.info("✅ [1/3] %d mercados disponibles", len(ex.markets))
+
+        log.info("[2/3] Verificando autenticación y saldo USDC...")
+        total_bal = await _async(_fetch_total_portfolio_usdc)
+        free_usdc = await _async(_fetch_usdc_free)
+        log.info("✅ [2/3] Auth OK — USDC libre: %.2f / total: %.2f",
+                 free_usdc, total_bal)
+        connected = True
+
+        log.info("[3/3] Verificando pares del WATCHLIST en OKX...")
+        for sym in WATCHLIST:
+            if sym in ex.markets:
+                log.info("  ✅ %s disponible", sym)
+            else:
+                log.warning("  ⚠️ %s NO encontrado en OKX — revisar símbolo", sym)
+
+        # Comprobar BTC para el mensaje de arranque
+        btc_chg = await _async(_fetch_btc_1h_change)
+        btc_ok  = btc_chg > -BTC_DROP_BLOCK
+        log.info("✅ [3/3] BTC 1h: %+.2f%%", btc_chg)
+
+    except ccxt.AuthenticationError as e:
+        log.critical("❌ Autenticación OKX fallida: %s", e)
+        await bot.send_message(
+            chat_id=CHAT_ID,
+            text=(
+                f"⚠️ No puedo conectar con OKX porque las claves no son correctas.\n\n"
+                f"Comprueba OKX_API_KEY, OKX_SECRET_KEY y OKX_PASSPHRASE en Railway."
+            )
+        )
+        return   # no arrancar sin autenticación
+
+    except ccxt.NetworkError as e:
+        log.error("❌ Error de red OKX: %s — intentando arrancar de todas formas", e)
+
+    except Exception as e:
+        log.error("❌ Error inesperado: %s", e)
+
+    # ── Cargar estado previo ───────────────────────────────────────────────────
     load_state()
 
-    app = (Application.builder()
-           .token(TELEGRAM_TOKEN)
-           .post_init(startup)
-           .build())
+    # ── Arrancar bucles ───────────────────────────────────────────────────────
+    asyncio.create_task(_run_trading_loop(bot))
+    asyncio.create_task(_run_risk_loop(bot))
 
-    app.add_handler(CommandHandler("start",         cmd_start))
-    app.add_handler(CommandHandler("ayuda",         cmd_ayuda))
-    app.add_handler(CommandHandler("cartera",       cmd_cartera))
-    app.add_handler(CommandHandler("compra",        cmd_compra))
-    app.add_handler(CommandHandler("venta",         cmd_venta))
-    app.add_handler(CommandHandler("precio",        cmd_precio))
-    app.add_handler(CommandHandler("buscar",        cmd_buscar))
-    app.add_handler(CommandHandler("analizar",      cmd_analizar))
-    app.add_handler(CommandHandler("mercado",       cmd_mercado))
-    app.add_handler(CommandHandler("monitor",       cmd_monitor))
-    app.add_handler(CommandHandler("forzarmonitor", cmd_forzar_monitor))
-    app.add_handler(CommandHandler("cancelar",      cmd_cancelar))
-    app.add_handler(CallbackQueryHandler(callback_handler))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, unknown_handler))
+    # ── Mensaje de bienvenida ─────────────────────────────────────────────────
+    if connected:
+        await _msg_arranque(bot, total_bal, btc_ok)
+    else:
+        await _notify(bot,
+            "He arrancado pero tengo problemas para conectar con el exchange. "
+            "Lo seguiré intentando automáticamente."
+        )
 
-    log.info("Bot v19 arrancado — Aggressive Hunter — monitor horario cada %dh — %s", MONITOR_HOURS, CURRENCY_SYM)
-    app.run_polling(allowed_updates=["message", "callback_query"])
+    log.info("════ BOT LISTO — %s ════", "DRY RUN" if DRY_RUN else "MODO REAL")
+
+    # ── Mantener el proceso vivo ───────────────────────────────────────────────
+    # (no usamos Application porque no hay comandos de Telegram)
+    while True:
+        await asyncio.sleep(3600)
+
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
