@@ -1,25 +1,19 @@
 """
-CRYPTO BOT PRO v20.2.2-fix — OKX USDC Watcher (Mainnet forzada)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Exchange  : OKX SPOT · Mainnet · sandbox=False · hostname=www.okx.com
-Moneda    : USDC (no USDT)
-Capital   : ~91.94 USDC → 25 USDC por operación · máx. 3 abiertas
+CRYPTO BOT PRO v20.2.2 — OKX USDC Watcher (Europa)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Exchange  : OKX SPOT · my.okx.com · sandbox=False
+Moneda    : USDC
+Capital   : 25 USDC por operación · máx. 3 abiertas
 Vigilancia: TAO/USDC · RENDER/USDC · FET/USDC · SOL/USDC
-Señal     : RSI < 32 + MACD girando al alza + BTC estable (no cae >1%/1h)
+Señal     : RSI < 32 + MACD girando al alza + BTC estable
 Riesgo    : SL -2.5% · TP +4% · Kill Switch -5%/día
-Telegram  : Solo notificaciones · sin comandos · lenguaje llano
-
-CORRECCIONES vs v20.2.2:
-  · sandbox=False forzado explícitamente (evita error OKX 50119)
-  · hostname="www.okx.com" fija el endpoint de Mainnet
-  · Diagnóstico de credenciales en log al arrancar
-  · Primeros 4 chars de API key en log si falla autenticación
+Telegram  : Solo notificaciones · lenguaje llano
 
 VARIABLES DE ENTORNO:
   TELEGRAM_TOKEN, CHAT_ID
   OKX_API_KEY, OKX_SECRET_KEY, OKX_PASSPHRASE
   DRY_RUN=true
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
 import os, json, asyncio, logging, time, math
@@ -33,12 +27,12 @@ from telegram import Bot
 # ══════════════════════════════════════════════════════════════════════════════
 # CONFIGURACIÓN
 # ══════════════════════════════════════════════════════════════════════════════
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
-CHAT_ID        = os.environ.get("CHAT_ID", "")
-OKX_API_KEY    = os.environ.get("OKX_API_KEY", "")
-OKX_SECRET     = os.environ.get("OKX_SECRET_KEY", "")
-OKX_PASSPHRASE = os.environ.get("OKX_PASSPHRASE", "")
-DRY_RUN        = os.environ.get("DRY_RUN", "true").lower() == "true"
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
+CHAT_ID        = os.environ.get("CHAT_ID", "").strip()
+OKX_API_KEY    = os.environ.get("OKX_API_KEY", "").strip()
+OKX_SECRET     = os.environ.get("OKX_SECRET_KEY", "").strip()
+OKX_PASSPHRASE = os.environ.get("OKX_PASSPHRASE", "").strip()
+DRY_RUN        = os.environ.get("DRY_RUN", "true").strip().lower() == "true"
 
 # ── Persistencia ──────────────────────────────────────────────────────────────
 POSITIONS_FILE = "positions.json"
@@ -123,59 +117,30 @@ _exchange: Optional[ccxt.okx] = None
 
 def get_exchange() -> ccxt.okx:
     """
-    Conector OKX SPOT — Mainnet forzada.
+    Conector OKX SPOT — Mainnet Europa.
 
-    Parámetros críticos para evitar el error 50119 ("API key doesn't exist"):
-    ─────────────────────────────────────────────────────────────────────────
-    · sandbox=False          → fuerza explícitamente la red real (Mainnet).
-                               Sin este flag, algunas versiones de CCXT pueden
-                               intentar conectar al entorno de demo de OKX,
-                               donde las claves reales no existen.
-
-    · hostname="www.okx.com" → fija el endpoint HTTP a la URL de producción.
-                               Equivalente a escribir directamente la dirección
-                               de la Mainnet, sin depender de la lógica interna
-                               de CCXT para elegir el host.
-
-    · adjustForTimeDifference=True → OKX rechaza peticiones con timestamp
-                               desviado >30 s del servidor. Railway usa IPs
-                               dinámicas cuyo reloj puede desviarse; este flag
-                               hace que CCXT consulte el tiempo del servidor
-                               antes de firmar la petición.
-
-    · nonce → función personalizada basada en time.time_ns() para máxima
-               precisión del timestamp en nanosegundos, lo que reduce aún más
-               los rechazos por firma inválida.
+    · hostname="my.okx.com"           → endpoint para usuarios europeos
+    · sandbox=False                    → red real, nunca demo
+    · adjustForTimeDifference=True     → sincroniza el timestamp con OKX
+                                         (evita rechazos por firma desfasada
+                                         en Railway, donde el reloj puede
+                                         desviarse del servidor de OKX)
+    · enableRateLimit=True             → CCXT gestiona el rate limit
+    · defaultType="spot"               → cuenta Trading, mercado Spot
     """
     global _exchange
     if _exchange is None:
-        # ── Diagnóstico de credenciales (visible en los logs de Railway) ──────
-        key_preview        = (OKX_API_KEY[:4]    + "****") if OKX_API_KEY    else "❌ VACÍA"
-        secret_preview     = (OKX_SECRET[:4]     + "****") if OKX_SECRET     else "❌ VACÍA"
-        passphrase_preview = ("****" + OKX_PASSPHRASE[-2:]) if OKX_PASSPHRASE else "❌ VACÍA"
-        log.info("═══ DIAGNÓSTICO DE CREDENCIALES OKX ═══")
-        log.info("  OKX_API_KEY       → empieza por: %s", key_preview)
-        log.info("  OKX_SECRET_KEY    → empieza por: %s", secret_preview)
-        log.info("  OKX_PASSPHRASE    → termina en:  %s", passphrase_preview)
-        log.info("  DRY_RUN           → %s", DRY_RUN)
-        log.info("  Endpoint forzado  → https://www.okx.com (Mainnet)")
-        log.info("════════════════════════════════════════")
-
         _exchange = ccxt.okx({
             "apiKey":   OKX_API_KEY,
             "secret":   OKX_SECRET,
-            "password": OKX_PASSPHRASE,   # passphrase — tercer factor de OKX
-
-            # ── MAINNET FORZADA ───────────────────────────────────────────────
-            "sandbox":  False,            # jamás usar la red de demo
-            "hostname": "www.okx.com",    # endpoint de producción explícito
-
+            "password": OKX_PASSPHRASE,
+            "sandbox":  False,
+            "hostname": "my.okx.com",
             "options": {
-                "defaultType":             "spot",   # cuenta Trading, mercado Spot
-                "adjustForTimeDifference": True,     # sincroniza timestamp con OKX
+                "defaultType":             "spot",
+                "adjustForTimeDifference": True,
             },
-
-            "enableRateLimit": True,      # CCXT gestiona el rate limit automáticamente
+            "enableRateLimit": True,
         })
     return _exchange
 
@@ -727,7 +692,7 @@ async def main():
     if not TELEGRAM_TOKEN:
         raise RuntimeError("TELEGRAM_TOKEN no configurado")
 
-    log.info("════ INICIANDO BOT v20.2.2-fix — OKX USDC WATCHER (Mainnet) ════")
+    log.info("════ INICIANDO BOT v20.2.2 — OKX USDC WATCHER ════")
 
     # Construir el objeto Bot de Telegram (sin Application — no necesitamos comandos)
     bot = Bot(token=TELEGRAM_TOKEN)
@@ -764,55 +729,21 @@ async def main():
         log.info("✅ [3/3] BTC 1h: %+.2f%%", btc_chg)
 
     except ccxt.AuthenticationError as e:
-        # Error 50119 = "API key doesn't exist" en OKX
-        # Las causas más frecuentes son:
-        #   1. La key apunta al entorno demo en lugar de Mainnet
-        #   2. La variable de entorno llega vacía o con espacios
-        #   3. El passphrase no coincide con el de la key
-        key_preview = (OKX_API_KEY[:4] + "****") if OKX_API_KEY else "❌ VACÍA"
-        log.critical("❌ Error de autenticación OKX (código 50119 o similar)")
-        log.critical("   Mensaje original: %s", e)
-        log.critical("   OKX_API_KEY  → empieza por: %s  (longitud: %d)",
-                     key_preview, len(OKX_API_KEY))
-        log.critical("   OKX_SECRET   → longitud: %d  (esperada: 32 chars aprox.)",
-                     len(OKX_SECRET))
-        log.critical("   OKX_PASSPHRASE → longitud: %d  (debe ser > 0)",
-                     len(OKX_PASSPHRASE))
-        log.critical("   Endpoint usado → www.okx.com (Mainnet, sandbox=False)")
-        log.critical("   ─── POSIBLES CAUSAS ───────────────────────────────")
-        log.critical("   · La key fue creada en el entorno DEMO de OKX")
-        log.critical("     → Crea una nueva key en https://www.okx.com > API")
-        log.critical("   · OKX_API_KEY llega vacía desde Railway")
-        log.critical("     → Revisa que NO haya espacios antes/después del valor")
-        log.critical("   · El Passphrase no coincide con el registrado en la key")
-        log.critical("     → Recrea la API key y copia el passphrase al crearla")
-        log.critical("   ────────────────────────────────────────────────────")
+        log.critical("❌ Error de autenticación OKX: %s", e)
         await bot.send_message(
             chat_id=CHAT_ID,
             text=(
-                f"⚠️ No puedo conectar con OKX. Error de clave (código 50119).\n\n"
-                f"He guardado el diagnóstico en los logs de Railway.\n"
-                f"Posibles causas:\n"
-                f"  · La API key fue creada en el entorno de DEMO\n"
-                f"  · Alguna variable de entorno llegó vacía\n"
-                f"  · El passphrase no coincide con el de la key\n\n"
-                f"Clave leída (primeros 4 caracteres): {key_preview}"
+                "⚠️ No puedo conectar con OKX porque las claves no son correctas.\n\n"
+                "Comprueba OKX_API_KEY, OKX_SECRET_KEY y OKX_PASSPHRASE en Railway."
             )
         )
-        return   # no arrancar sin autenticación válida
+        return
 
     except ccxt.NetworkError as e:
         log.error("❌ Error de red OKX: %s — intentando arrancar de todas formas", e)
 
     except Exception as e:
-        # A veces OKX devuelve el error 50119 envuelto en una ExchangeError genérica
-        key_preview = (OKX_API_KEY[:4] + "****") if OKX_API_KEY else "❌ VACÍA"
         log.error("❌ Error inesperado al conectar con OKX: %s", e)
-        log.error("   Tipo de error: %s", type(e).__name__)
-        log.error("   OKX_API_KEY → empieza por: %s (longitud: %d)",
-                  key_preview, len(OKX_API_KEY))
-        log.error("   OKX_PASSPHRASE → longitud: %d", len(OKX_PASSPHRASE))
-        log.error("   Si ves '50119' en el mensaje anterior, la key apunta al DEMO.")
 
     # ── Cargar estado previo ───────────────────────────────────────────────────
     load_state()
