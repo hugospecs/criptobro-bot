@@ -59,22 +59,18 @@ BTC_DROP_BLOCK   = 1.0     # no comprar si BTC bajó > 1% en la última hora
 
 # ── Lista fija de monedas a vigilar (en USDC) ─────────────────────────────────
 WATCHLIST = [
-    "SOL/USDC",
-    "FET/USDC",
-    "RENDER/USDC",
     "TAO/USDC",
-    "NEAR/USDC",
-    "LINK/USDC",
+    "RENDER/USDC",
+    "FET/USDC",
+    "SOL/USDC",
 ]
 
 # Nombres amigables para los mensajes de Telegram
 COIN_NAMES = {
-    "SOL/USDC":    "Solana",
-    "FET/USDC":    "Fetch.AI",
-    "RENDER/USDC": "Render",
     "TAO/USDC":    "TAO (Bittensor)",
-    "NEAR/USDC":   "NEAR Protocol",
-    "LINK/USDC":   "Chainlink",
+    "RENDER/USDC": "Render",
+    "FET/USDC":    "Fetch.AI",
+    "SOL/USDC":    "Solana",
 }
 
 logging.basicConfig(
@@ -343,12 +339,10 @@ async def _msg_arranque(bot: Bot, total_bal: float, btc_ok: bool):
         f"{dry_note}"
         f"¡Hola! 👋 Acabo de arrancar y estoy listo para vigilar el mercado.\n\n"
         f"Voy a estar pendiente de:\n"
-        f"  · Solana\n"
-        f"  · Fetch.AI\n"
-        f"  · Render\n"
         f"  · TAO (Bittensor)\n"
-        f"  · NEAR Protocol\n"
-        f"  · Chainlink\n\n"
+        f"  · Render\n"
+        f"  · Fetch.AI\n"
+        f"  · Solana\n\n"
         f"Usaré 25 dólares por cada compra y no haré más de 3 a la vez.\n"
         f"{btc_msg}\n\n"
         f"💰 Tu dinero total ahora mismo: {total_bal:.2f} USDC"
