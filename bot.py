@@ -35,7 +35,11 @@ OKX_PASSPHRASE = os.environ.get("OKX_PASSPHRASE", "").strip()
 DRY_RUN        = os.environ.get("DRY_RUN", "true").strip().lower() == "true"
 
 # ── Persistencia ──────────────────────────────────────────────────────────────
-POSITIONS_FILE = "positions.json"
+# Si DATA_PATH está definido (Railway Volume), usar esa ruta.
+# Si no, usar el directorio actual (entorno local / testing).
+_DATA_PATH     = os.environ.get("DATA_PATH", "").strip()
+POSITIONS_FILE = os.path.join(_DATA_PATH, "positions.json") if _DATA_PATH \
+                 else "positions.json"
 
 # ── Timing ────────────────────────────────────────────────────────────────────
 TRADE_LOOP_SEC = 15 * 60   # análisis cada 15 minutos
@@ -108,9 +112,20 @@ def load_state():
             log.warning("Error cargando estado: %s", e)
 
 def save_state():
+    """
+    Guarda el estado en disco de forma atómica:
+    1. os.makedirs — crea el directorio si no existe (Railway Volume).
+    2. Escribe en un fichero temporal (.tmp) para no dejar el JSON a medias.
+    3. os.replace — renombrado atómico: el fichero final nunca queda corrupto,
+       ni siquiera si Railway reinicia el contenedor durante la escritura.
+    """
     try:
-        with open(POSITIONS_FILE, "w") as f:
+        target_dir = os.path.dirname(os.path.abspath(POSITIONS_FILE))
+        os.makedirs(target_dir, exist_ok=True)
+        tmp_file = POSITIONS_FILE + ".tmp"
+        with open(tmp_file, "w") as f:
             json.dump(state, f, indent=2, default=str)
+        os.replace(tmp_file, POSITIONS_FILE)
     except Exception as e:
         log.error("Error guardando estado: %s", e)
 
@@ -215,17 +230,77 @@ def _round_step(value: float, step: float) -> float:
 
 def _fetch_usdc_free() -> float:
     """Saldo libre de USDC en la cuenta Trading (Spot) de OKX."""
-    ex  = get_exchange()
-    bal = ex.fetch_balance()
-    return float((bal.get("USDC") or {}).get("free", 0.0) or 0.0)
+    ex = get_exchange()
+    try:
+        bal = ex.fetch_balance()
+        return float((bal.get("USDC") or {}).get("free", 0.0) or 0.0)
+    except ccxt.AuthenticationError as e:
+        log.error("═══ [DIAG] AuthenticationError en fetch_balance ═══")
+        log.error("  Mensaje completo : %s", str(e))
+        log.error("  Tipo             : %s", type(e).__name__)
+        # Extraer el cuerpo raw de la respuesta HTTP (contiene el código OKX)
+        raw = getattr(e, "args", None)
+        if raw:
+            log.error("  args[0]          : %s", raw[0] if raw else "—")
+        log.error("  Endpoint usado   : my.okx.com (sandbox=False)")
+        log.error("  API key presente : %s", bool(OKX_API_KEY))
+        log.error("  Passphrase pres. : %s", bool(OKX_PASSPHRASE))
+        log.exception("  Traceback completo:")
+        raise
+    except ccxt.ExchangeError as e:
+        log.error("═══ [DIAG] ExchangeError en fetch_balance ═══")
+        log.error("  Mensaje completo : %s", str(e))
+        log.error("  Tipo             : %s", type(e).__name__)
+        raw = getattr(e, "args", None)
+        if raw:
+            log.error("  args[0]          : %s", raw[0] if raw else "—")
+        log.exception("  Traceback completo:")
+        raise
 
 def _fetch_total_portfolio_usdc() -> float:
     """
     Valoración total en USDC:
     USDC libre + valor de mercado de los tokens en posiciones abiertas.
+
+    [DIAG] Bloque de diagnóstico activo — captura el cuerpo completo de la
+    respuesta OKX para identificar el código de error numérico (ej. 50113).
     """
-    ex    = get_exchange()
-    bal   = ex.fetch_balance()
+    ex = get_exchange()
+
+    # ── fetch_balance con captura diagnóstica ────────────────────────────────
+    try:
+        bal = ex.fetch_balance()
+    except ccxt.AuthenticationError as e:
+        # OKX devuelve códigos como 50113 (timestamp), 50119 (key no existe),
+        # 50111 (passphrase inválido) dentro del mensaje de error.
+        log.error("═══ [DIAG] AuthenticationError en fetch_balance (portfolio) ═══")
+        log.error("  Mensaje completo OKX : %s", str(e))
+        log.error("  Tipo de excepción    : %s", type(e).__name__)
+        # args[0] contiene el body raw de la respuesta HTTP de OKX
+        raw_args = getattr(e, "args", ())
+        for i, arg in enumerate(raw_args):
+            log.error("  args[%d]             : %s", i, arg)
+        log.error("  Hostname configurado : my.okx.com")
+        log.error("  sandbox              : False")
+        log.error("  API key presente     : %s", bool(OKX_API_KEY))
+        log.error("  Secret presente      : %s", bool(OKX_SECRET))
+        log.error("  Passphrase presente  : %s", bool(OKX_PASSPHRASE))
+        log.error("  Busca el código OKX en el mensaje de arriba:")
+        log.error("  50113=timestamp, 50119=key no existe,")
+        log.error("  50111=passphrase incorrecto, 50001=error sistema")
+        log.exception("  Traceback completo (Railway logs):")
+        raise
+    except ccxt.ExchangeError as e:
+        log.error("═══ [DIAG] ExchangeError en fetch_balance (portfolio) ═══")
+        log.error("  Mensaje completo OKX : %s", str(e))
+        log.error("  Tipo de excepción    : %s", type(e).__name__)
+        raw_args = getattr(e, "args", ())
+        for i, arg in enumerate(raw_args):
+            log.error("  args[%d]             : %s", i, arg)
+        log.exception("  Traceback completo:")
+        raise
+
+    # ── Procesar balance ──────────────────────────────────────────────────────
     total = float((bal.get("USDC") or {}).get("total", 0.0) or 0.0)
 
     skip = {"USDC", "USDT", "info", "free", "used", "total",
@@ -699,6 +774,7 @@ async def main():
         raise RuntimeError("TELEGRAM_TOKEN no configurado")
 
     log.info("════ INICIANDO BOT v20.2.2 — OKX USDC WATCHER ════")
+    log.info("Persistencia activada en: %s", os.path.abspath(POSITIONS_FILE))
 
     # Construir el objeto Bot de Telegram (sin Application — no necesitamos comandos)
     bot = Bot(token=TELEGRAM_TOKEN)
@@ -735,7 +811,19 @@ async def main():
         log.info("✅ [3/3] BTC 1h: %+.2f%%", btc_chg)
 
     except ccxt.AuthenticationError as e:
-        log.critical("❌ Error de autenticación OKX: %s", e)
+        log.error("═══ [DIAG] AuthenticationError en arranque ═══")
+        log.error("  Mensaje completo OKX : %s", str(e))
+        log.error("  Tipo de excepción    : %s", type(e).__name__)
+        raw_args = getattr(e, "args", ())
+        for i, arg in enumerate(raw_args):
+            log.error("  args[%d]             : %s", i, arg)
+        log.error("  Hostname             : my.okx.com")
+        log.error("  sandbox              : False")
+        log.error("  API key presente     : %s", bool(OKX_API_KEY))
+        log.error("  Secret presente      : %s", bool(OKX_SECRET))
+        log.error("  Passphrase presente  : %s", bool(OKX_PASSPHRASE))
+        log.error("  Busca el código OKX numérico en el mensaje de arriba")
+        log.exception("  Traceback completo:")
         await bot.send_message(
             chat_id=CHAT_ID,
             text=(
@@ -749,7 +837,13 @@ async def main():
         log.error("❌ Error de red OKX: %s — intentando arrancar de todas formas", e)
 
     except Exception as e:
-        log.error("❌ Error inesperado al conectar con OKX: %s", e)
+        log.error("═══ [DIAG] Excepción inesperada en arranque ═══")
+        log.error("  Mensaje    : %s", str(e))
+        log.error("  Tipo       : %s", type(e).__name__)
+        raw_args = getattr(e, "args", ())
+        for i, arg in enumerate(raw_args):
+            log.error("  args[%d]   : %s", i, arg)
+        log.exception("  Traceback completo:")
 
     # ── Cargar estado previo ───────────────────────────────────────────────────
     load_state()
