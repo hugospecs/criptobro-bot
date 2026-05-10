@@ -22,8 +22,7 @@ from functools import partial
 from typing import Optional
 
 import ccxt
-from telegram import Bot, Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram import Bot
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CONFIGURACIÓN
@@ -67,6 +66,7 @@ WATCHLIST = [
     "SOL/USDC",
     "FET/USDC",
     "RENDER/USDC",
+    "TAO/USDC",
     "NEAR/USDC",
     "LINK/USDC",
 ]
@@ -76,6 +76,7 @@ COIN_NAMES = {
     "SOL/USDC":    "Solana",
     "FET/USDC":    "Fetch.AI",
     "RENDER/USDC": "Render",
+    "TAO/USDC":    "TAO (Bittensor)",
     "NEAR/USDC":   "NEAR Protocol",
     "LINK/USDC":   "Chainlink",
 }
@@ -229,18 +230,77 @@ def _round_step(value: float, step: float) -> float:
 
 def _fetch_usdc_free() -> float:
     """Saldo libre de USDC en la cuenta Trading (Spot) de OKX."""
-    ex  = get_exchange()
-    bal = ex.fetch_balance()
-    return float((bal.get("USDC") or {}).get("free", 0.0) or 0.0)
+    ex = get_exchange()
+    try:
+        bal = ex.fetch_balance()
+        return float((bal.get("USDC") or {}).get("free", 0.0) or 0.0)
+    except ccxt.AuthenticationError as e:
+        log.error("═══ [DIAG] AuthenticationError en fetch_balance ═══")
+        log.error("  Mensaje completo : %s", str(e))
+        log.error("  Tipo             : %s", type(e).__name__)
+        # Extraer el cuerpo raw de la respuesta HTTP (contiene el código OKX)
+        raw = getattr(e, "args", None)
+        if raw:
+            log.error("  args[0]          : %s", raw[0] if raw else "—")
+        log.error("  Endpoint usado   : my.okx.com (sandbox=False)")
+        log.error("  API key presente : %s", bool(OKX_API_KEY))
+        log.error("  Passphrase pres. : %s", bool(OKX_PASSPHRASE))
+        log.exception("  Traceback completo:")
+        raise
+    except ccxt.ExchangeError as e:
+        log.error("═══ [DIAG] ExchangeError en fetch_balance ═══")
+        log.error("  Mensaje completo : %s", str(e))
+        log.error("  Tipo             : %s", type(e).__name__)
+        raw = getattr(e, "args", None)
+        if raw:
+            log.error("  args[0]          : %s", raw[0] if raw else "—")
+        log.exception("  Traceback completo:")
+        raise
 
 def _fetch_total_portfolio_usdc() -> float:
     """
     Valoración total en USDC:
     USDC libre + valor de mercado de los tokens en posiciones abiertas.
-    """
-    ex  = get_exchange()
-    bal = ex.fetch_balance()
 
+    [DIAG] Bloque de diagnóstico activo — captura el cuerpo completo de la
+    respuesta OKX para identificar el código de error numérico (ej. 50113).
+    """
+    ex = get_exchange()
+
+    # ── fetch_balance con captura diagnóstica ────────────────────────────────
+    try:
+        bal = ex.fetch_balance()
+    except ccxt.AuthenticationError as e:
+        # OKX devuelve códigos como 50113 (timestamp), 50119 (key no existe),
+        # 50111 (passphrase inválido) dentro del mensaje de error.
+        log.error("═══ [DIAG] AuthenticationError en fetch_balance (portfolio) ═══")
+        log.error("  Mensaje completo OKX : %s", str(e))
+        log.error("  Tipo de excepción    : %s", type(e).__name__)
+        # args[0] contiene el body raw de la respuesta HTTP de OKX
+        raw_args = getattr(e, "args", ())
+        for i, arg in enumerate(raw_args):
+            log.error("  args[%d]             : %s", i, arg)
+        log.error("  Hostname configurado : my.okx.com")
+        log.error("  sandbox              : False")
+        log.error("  API key presente     : %s", bool(OKX_API_KEY))
+        log.error("  Secret presente      : %s", bool(OKX_SECRET))
+        log.error("  Passphrase presente  : %s", bool(OKX_PASSPHRASE))
+        log.error("  Busca el código OKX en el mensaje de arriba:")
+        log.error("  50113=timestamp, 50119=key no existe,")
+        log.error("  50111=passphrase incorrecto, 50001=error sistema")
+        log.exception("  Traceback completo (Railway logs):")
+        raise
+    except ccxt.ExchangeError as e:
+        log.error("═══ [DIAG] ExchangeError en fetch_balance (portfolio) ═══")
+        log.error("  Mensaje completo OKX : %s", str(e))
+        log.error("  Tipo de excepción    : %s", type(e).__name__)
+        raw_args = getattr(e, "args", ())
+        for i, arg in enumerate(raw_args):
+            log.error("  args[%d]             : %s", i, arg)
+        log.exception("  Traceback completo:")
+        raise
+
+    # ── Procesar balance ──────────────────────────────────────────────────────
     total = float((bal.get("USDC") or {}).get("total", 0.0) or 0.0)
 
     skip = {"USDC", "USDT", "info", "free", "used", "total",
@@ -361,6 +421,7 @@ async def _msg_arranque(bot: Bot, total_bal: float, btc_ok: bool):
         f"  · Solana\n"
         f"  · Fetch.AI\n"
         f"  · Render\n"
+        f"  · TAO (Bittensor)\n"
         f"  · NEAR Protocol\n"
         f"  · Chainlink\n\n"
         f"Usaré 25 dólares por cada compra y no haré más de 3 a la vez.\n"
@@ -702,109 +763,26 @@ async def _run_risk_loop(bot: Bot):
         await asyncio.sleep(RISK_LOOP_SEC)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# COMANDO /status — HANDLER DE TELEGRAM
-# ══════════════════════════════════════════════════════════════════════════════
-async def status_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """
-    Responde al comando /status con un resumen completo del bot:
-    · Modo (DRY RUN o REAL)
-    · Balance total estimado en USDC
-    · Posiciones abiertas con precio de entrada y P&L actual
-    · Estado de la persistencia (existe positions.json en el volumen)
-    Solo responde si el mensaje viene del CHAT_ID autorizado.
-    """
-    # Seguridad: ignorar mensajes de chats no autorizados
-    if str(update.effective_chat.id) != CHAT_ID:
-        return
-
-    positions = state.get("positions", {})
-    mode_str  = "🧪 SIMULACIÓN (DRY RUN)" if DRY_RUN else "🔴 MODO REAL"
-    ks_str    = "⛔ Kill Switch ACTIVO" if state.get("kill_switch") else "✅ Operando con normalidad"
-
-    # Obtener balance actual
-    try:
-        total_bal = await _async(_fetch_total_portfolio_usdc)
-        bal_str   = f"{total_bal:.2f} USDC"
-    except Exception:
-        bal_str   = "No disponible (error de conexión)"
-
-    # Construir sección de posiciones abiertas
-    if positions:
-        pos_lines = []
-        for symbol, pos in positions.items():
-            try:
-                price   = await _async(_fetch_price, symbol)
-                entry   = pos.get("entry_price", 0)
-                pnl_pct = ((price - entry) / entry * 100.0) if entry else 0.0
-                inv     = pos.get("invested", 0)
-                icon    = "📈" if pnl_pct >= 0 else "📉"
-                pos_lines.append(
-                    f"  {icon} {_coin_label(symbol)}\n"
-                    f"     Entrada: {entry:.4f} | Ahora: {price:.4f}\n"
-                    f"     Invertido: {inv:.2f} USDC | P&L: {pnl_pct:+.2f}%"
-                )
-            except Exception:
-                pos_lines.append(f"  ⚪ {_coin_label(symbol)} — sin precio")
-        positions_str = "\n".join(pos_lines)
-    else:
-        positions_str = "  Sin posiciones abiertas."
-
-    # Estado de persistencia
-    abs_path   = os.path.abspath(POSITIONS_FILE)
-    file_exists = os.path.exists(POSITIONS_FILE)
-    persist_str = (
-        f"✅ {abs_path}"
-        if file_exists
-        else f"⚠️ Archivo no encontrado: {abs_path}"
-    )
-
-    pnl_hoy  = state.get("daily_realized_pnl", 0.0)
-    last_scan = state.get("last_scan", "Nunca")
-
-    msg = (
-        f"📊 Estado del Bot\n"
-        f"{'─'*30}\n"
-        f"Modo: {mode_str}\n"
-        f"Estado: {ks_str}\n"
-        f"Balance total: {bal_str}\n"
-        f"P&L realizado hoy: {pnl_hoy:+.2f} USDC\n"
-        f"Último ciclo: {last_scan}\n\n"
-        f"Posiciones ({len(positions)}/{MAX_POSITIONS}):\n"
-        f"{positions_str}\n\n"
-        f"Persistencia:\n"
-        f"  {persist_str}"
-    )
-
-    await update.message.reply_text(msg)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
 # ARRANQUE
 # ══════════════════════════════════════════════════════════════════════════════
 async def main():
     """
     Punto de entrada principal.
-    - Verifica OKX en 3 pasos.
-    - Registra el comando /status.
-    - Arranca trading_loop y risk_loop en post_init (antes del polling).
-    - run_polling() mantiene el proceso vivo y escucha comandos.
+    Verifica OKX en 3 pasos, arranca los bucles y envía el mensaje de bienvenida.
     """
     if not TELEGRAM_TOKEN:
         raise RuntimeError("TELEGRAM_TOKEN no configurado")
 
-    log.info("════ INICIANDO BOT v20.3 — OKX USDC WATCHER ════")
+    log.info("════ INICIANDO BOT v20.2.2 — OKX USDC WATCHER ════")
     log.info("Persistencia activada en: %s", os.path.abspath(POSITIONS_FILE))
 
-    load_state()
+    # Construir el objeto Bot de Telegram (sin Application — no necesitamos comandos)
+    bot = Bot(token=TELEGRAM_TOKEN)
 
     # ── Verificación OKX ──────────────────────────────────────────────────────
     total_bal = 0.0
     btc_ok    = True
     connected = False
-
-    # Necesitamos un bot provisional para enviar alertas de error antes de
-    # que Application esté listo.
-    _tmp_bot = Bot(token=TELEGRAM_TOKEN)
 
     try:
         ex = get_exchange()
@@ -827,13 +805,26 @@ async def main():
             else:
                 log.warning("  ⚠️ %s NO encontrado en OKX — revisar símbolo", sym)
 
+        # Comprobar BTC para el mensaje de arranque
         btc_chg = await _async(_fetch_btc_1h_change)
         btc_ok  = btc_chg > -BTC_DROP_BLOCK
         log.info("✅ [3/3] BTC 1h: %+.2f%%", btc_chg)
 
     except ccxt.AuthenticationError as e:
-        log.error("❌ Error de autenticación OKX: %s", e)
-        await _tmp_bot.send_message(
+        log.error("═══ [DIAG] AuthenticationError en arranque ═══")
+        log.error("  Mensaje completo OKX : %s", str(e))
+        log.error("  Tipo de excepción    : %s", type(e).__name__)
+        raw_args = getattr(e, "args", ())
+        for i, arg in enumerate(raw_args):
+            log.error("  args[%d]             : %s", i, arg)
+        log.error("  Hostname             : my.okx.com")
+        log.error("  sandbox              : False")
+        log.error("  API key presente     : %s", bool(OKX_API_KEY))
+        log.error("  Secret presente      : %s", bool(OKX_SECRET))
+        log.error("  Passphrase presente  : %s", bool(OKX_PASSPHRASE))
+        log.error("  Busca el código OKX numérico en el mensaje de arriba")
+        log.exception("  Traceback completo:")
+        await bot.send_message(
             chat_id=CHAT_ID,
             text=(
                 "⚠️ No puedo conectar con OKX porque las claves no son correctas.\n\n"
@@ -846,36 +837,36 @@ async def main():
         log.error("❌ Error de red OKX: %s — intentando arrancar de todas formas", e)
 
     except Exception as e:
-        log.error("❌ Error inesperado al conectar con OKX: %s", e)
+        log.error("═══ [DIAG] Excepción inesperada en arranque ═══")
+        log.error("  Mensaje    : %s", str(e))
+        log.error("  Tipo       : %s", type(e).__name__)
+        raw_args = getattr(e, "args", ())
+        for i, arg in enumerate(raw_args):
+            log.error("  args[%d]   : %s", i, arg)
+        log.exception("  Traceback completo:")
 
-    # ── Construir Application con ApplicationBuilder ──────────────────────────
-    # post_init se ejecuta justo antes de que run_polling() empiece a escuchar,
-    # dentro del mismo event loop — es el lugar correcto para lanzar tasks.
-    async def _post_init(app):
-        bot = app.bot
-        asyncio.create_task(_run_trading_loop(bot))
-        asyncio.create_task(_run_risk_loop(bot))
-        if connected:
-            await _msg_arranque(bot, total_bal, btc_ok)
-        else:
-            await _notify(bot,
-                "He arrancado pero tengo problemas para conectar con el exchange. "
-                "Lo seguiré intentando automáticamente."
-            )
-        log.info("════ BOT LISTO — %s ════", "DRY RUN" if DRY_RUN else "MODO REAL")
+    # ── Cargar estado previo ───────────────────────────────────────────────────
+    load_state()
 
-    app = (
-        ApplicationBuilder()
-        .token(TELEGRAM_TOKEN)
-        .post_init(_post_init)
-        .build()
-    )
+    # ── Arrancar bucles ───────────────────────────────────────────────────────
+    asyncio.create_task(_run_trading_loop(bot))
+    asyncio.create_task(_run_risk_loop(bot))
 
-    app.add_handler(CommandHandler("status", status_handler))
+    # ── Mensaje de bienvenida ─────────────────────────────────────────────────
+    if connected:
+        await _msg_arranque(bot, total_bal, btc_ok)
+    else:
+        await _notify(bot,
+            "He arrancado pero tengo problemas para conectar con el exchange. "
+            "Lo seguiré intentando automáticamente."
+        )
 
-    # run_polling() bloquea hasta que el proceso se detiene.
-    # Los bucles de fondo siguen corriendo en segundo plano gracias a asyncio.
-    await app.run_polling(allowed_updates=["message"])
+    log.info("════ BOT LISTO — %s ════", "DRY RUN" if DRY_RUN else "MODO REAL")
+
+    # ── Mantener el proceso vivo ───────────────────────────────────────────────
+    # (no usamos Application porque no hay comandos de Telegram)
+    while True:
+        await asyncio.sleep(3600)
 
 
 if __name__ == "__main__":
