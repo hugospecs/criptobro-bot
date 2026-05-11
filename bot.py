@@ -1,19 +1,20 @@
 """
-CRYPTO BOT PRO v20.2.2 — OKX USDC Watcher (Europa)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CRYPTO BOT PRO v20.3 — OKX USDC Watcher (Europa)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Exchange  : OKX SPOT · my.okx.com · sandbox=False
 Moneda    : USDC
 Capital   : 25 USDC por operación · máx. 3 abiertas
-Vigilancia: TAO/USDC · RENDER/USDC · FET/USDC · SOL/USDC
+Vigilancia: SOL · FET · RENDER · NEAR · LINK
 Señal     : RSI < 32 + MACD girando al alza + BTC estable
 Riesgo    : SL -2.5% · TP +4% · Kill Switch -5%/día
-Telegram  : Solo notificaciones · lenguaje llano
+Telegram  : Push-only · informe de estado al arrancar y a las 16:00
 
 VARIABLES DE ENTORNO:
   TELEGRAM_TOKEN, CHAT_ID
   OKX_API_KEY, OKX_SECRET_KEY, OKX_PASSPHRASE
   DRY_RUN=true
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  DATA_PATH=/app/data   (Railway Volume — opcional)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
 import os, json, asyncio, logging, time, math
@@ -42,8 +43,9 @@ POSITIONS_FILE = os.path.join(_DATA_PATH, "positions.json") if _DATA_PATH \
                  else "positions.json"
 
 # ── Timing ────────────────────────────────────────────────────────────────────
-TRADE_LOOP_SEC = 15 * 60   # análisis cada 15 minutos
-RISK_LOOP_SEC  = 60        # vigilancia de riesgo cada 60 segundos
+TRADE_LOOP_SEC     = 15 * 60   # análisis cada 15 minutos
+RISK_LOOP_SEC      = 60        # vigilancia de riesgo cada 60 segundos
+DAILY_REPORT_HOUR  = 16        # hora UTC del informe diario automático
 
 # ── Capital (en USDC) ─────────────────────────────────────────────────────────
 TRADE_USDC     = 25.0      # dólares por compra
@@ -56,17 +58,16 @@ TAKE_PROFIT_PCT  = 4.0
 KILL_SWITCH_PCT  = 5.0     # parar todo si el total cae > 5% en el día
 
 # ── Estrategia ────────────────────────────────────────────────────────────────
-TIMEFRAME        = "15m"
-OHLCV_LIMIT      = 100
-RSI_BUY          = 32
-BTC_DROP_BLOCK   = 1.0     # no comprar si BTC bajó > 1% en la última hora
+TIMEFRAME      = "15m"
+OHLCV_LIMIT    = 100
+RSI_BUY        = 32
+BTC_DROP_BLOCK = 1.0       # no comprar si BTC bajó > 1% en la última hora
 
 # ── Lista fija de monedas a vigilar (en USDC) ─────────────────────────────────
 WATCHLIST = [
     "SOL/USDC",
     "FET/USDC",
     "RENDER/USDC",
-    "TAO/USDC",
     "NEAR/USDC",
     "LINK/USDC",
 ]
@@ -76,7 +77,6 @@ COIN_NAMES = {
     "SOL/USDC":    "Solana",
     "FET/USDC":    "Fetch.AI",
     "RENDER/USDC": "Render",
-    "TAO/USDC":    "TAO (Bittensor)",
     "NEAR/USDC":   "NEAR Protocol",
     "LINK/USDC":   "Chainlink",
 }
@@ -137,7 +137,6 @@ _exchange: Optional[ccxt.okx] = None
 def get_exchange() -> ccxt.okx:
     """
     Conector OKX SPOT — Mainnet Europa.
-
     · hostname="my.okx.com"           → endpoint para usuarios europeos
     · sandbox=False                    → red real, nunca demo
     · adjustForTimeDifference=True     → sincroniza el timestamp con OKX
@@ -230,77 +229,18 @@ def _round_step(value: float, step: float) -> float:
 
 def _fetch_usdc_free() -> float:
     """Saldo libre de USDC en la cuenta Trading (Spot) de OKX."""
-    ex = get_exchange()
-    try:
-        bal = ex.fetch_balance()
-        return float((bal.get("USDC") or {}).get("free", 0.0) or 0.0)
-    except ccxt.AuthenticationError as e:
-        log.error("═══ [DIAG] AuthenticationError en fetch_balance ═══")
-        log.error("  Mensaje completo : %s", str(e))
-        log.error("  Tipo             : %s", type(e).__name__)
-        # Extraer el cuerpo raw de la respuesta HTTP (contiene el código OKX)
-        raw = getattr(e, "args", None)
-        if raw:
-            log.error("  args[0]          : %s", raw[0] if raw else "—")
-        log.error("  Endpoint usado   : my.okx.com (sandbox=False)")
-        log.error("  API key presente : %s", bool(OKX_API_KEY))
-        log.error("  Passphrase pres. : %s", bool(OKX_PASSPHRASE))
-        log.exception("  Traceback completo:")
-        raise
-    except ccxt.ExchangeError as e:
-        log.error("═══ [DIAG] ExchangeError en fetch_balance ═══")
-        log.error("  Mensaje completo : %s", str(e))
-        log.error("  Tipo             : %s", type(e).__name__)
-        raw = getattr(e, "args", None)
-        if raw:
-            log.error("  args[0]          : %s", raw[0] if raw else "—")
-        log.exception("  Traceback completo:")
-        raise
+    ex  = get_exchange()
+    bal = ex.fetch_balance()
+    return float((bal.get("USDC") or {}).get("free", 0.0) or 0.0)
 
 def _fetch_total_portfolio_usdc() -> float:
     """
     Valoración total en USDC:
     USDC libre + valor de mercado de los tokens en posiciones abiertas.
-
-    [DIAG] Bloque de diagnóstico activo — captura el cuerpo completo de la
-    respuesta OKX para identificar el código de error numérico (ej. 50113).
     """
-    ex = get_exchange()
+    ex  = get_exchange()
+    bal = ex.fetch_balance()
 
-    # ── fetch_balance con captura diagnóstica ────────────────────────────────
-    try:
-        bal = ex.fetch_balance()
-    except ccxt.AuthenticationError as e:
-        # OKX devuelve códigos como 50113 (timestamp), 50119 (key no existe),
-        # 50111 (passphrase inválido) dentro del mensaje de error.
-        log.error("═══ [DIAG] AuthenticationError en fetch_balance (portfolio) ═══")
-        log.error("  Mensaje completo OKX : %s", str(e))
-        log.error("  Tipo de excepción    : %s", type(e).__name__)
-        # args[0] contiene el body raw de la respuesta HTTP de OKX
-        raw_args = getattr(e, "args", ())
-        for i, arg in enumerate(raw_args):
-            log.error("  args[%d]             : %s", i, arg)
-        log.error("  Hostname configurado : my.okx.com")
-        log.error("  sandbox              : False")
-        log.error("  API key presente     : %s", bool(OKX_API_KEY))
-        log.error("  Secret presente      : %s", bool(OKX_SECRET))
-        log.error("  Passphrase presente  : %s", bool(OKX_PASSPHRASE))
-        log.error("  Busca el código OKX en el mensaje de arriba:")
-        log.error("  50113=timestamp, 50119=key no existe,")
-        log.error("  50111=passphrase incorrecto, 50001=error sistema")
-        log.exception("  Traceback completo (Railway logs):")
-        raise
-    except ccxt.ExchangeError as e:
-        log.error("═══ [DIAG] ExchangeError en fetch_balance (portfolio) ═══")
-        log.error("  Mensaje completo OKX : %s", str(e))
-        log.error("  Tipo de excepción    : %s", type(e).__name__)
-        raw_args = getattr(e, "args", ())
-        for i, arg in enumerate(raw_args):
-            log.error("  args[%d]             : %s", i, arg)
-        log.exception("  Traceback completo:")
-        raise
-
-    # ── Procesar balance ──────────────────────────────────────────────────────
     total = float((bal.get("USDC") or {}).get("total", 0.0) or 0.0)
 
     skip = {"USDC", "USDT", "info", "free", "used", "total",
@@ -335,8 +275,7 @@ def _fetch_price(symbol: str) -> float:
 
 def _fetch_btc_1h_change() -> float:
     """Cambio % del BTC en la última hora completa (vela 1h)."""
-    ex    = get_exchange()
-    # Usamos BTC/USDT ya que BTC/USDC puede no tener liquidez en OKX
+    ex = get_exchange()
     for pair in ("BTC/USDC", "BTC/USDT"):
         try:
             ohlcv = ex.fetch_ohlcv(pair, "1h", limit=2)
@@ -352,7 +291,7 @@ def _fetch_btc_1h_change() -> float:
 # TELEGRAM — MENSAJES EN LENGUAJE LLANO
 # ══════════════════════════════════════════════════════════════════════════════
 async def _notify(bot: Bot, text: str):
-    """Envía mensaje de texto plano (sin HTML técnico) al usuario."""
+    """Envía mensaje de texto plano al usuario."""
     if not CHAT_ID:
         return
     try:
@@ -410,25 +349,6 @@ async def _msg_kill_switch(bot: Bot, total_bal: float, drawdown: float):
         f"No haré nada hasta mañana que se reinicie el contador."
     )
 
-async def _msg_arranque(bot: Bot, total_bal: float, btc_ok: bool):
-    """Mensaje de arranque en lenguaje llano."""
-    dry_note = "⚠️ Estoy en modo SIMULACIÓN — no se mueve dinero real.\n\n" if DRY_RUN else ""
-    btc_msg  = "Bitcoin está estable hoy ✅" if btc_ok else "Bitcoin no está bien ahora ⛔"
-    await _notify(bot,
-        f"{dry_note}"
-        f"¡Hola! 👋 Acabo de arrancar y estoy listo para vigilar el mercado.\n\n"
-        f"Voy a estar pendiente de:\n"
-        f"  · Solana\n"
-        f"  · Fetch.AI\n"
-        f"  · Render\n"
-        f"  · TAO (Bittensor)\n"
-        f"  · NEAR Protocol\n"
-        f"  · Chainlink\n\n"
-        f"Usaré 25 dólares por cada compra y no haré más de 3 a la vez.\n"
-        f"{btc_msg}\n\n"
-        f"💰 Tu dinero total ahora mismo: {total_bal:.2f} USDC"
-    )
-
 async def _msg_error_grave(bot: Bot, motivo: str):
     """Aviso de error grave en lenguaje llano."""
     await _notify(bot,
@@ -436,6 +356,127 @@ async def _msg_error_grave(bot: Bot, motivo: str):
         f"Motivo técnico (para tu información): {motivo}\n\n"
         f"Lo seguiré intentando en el próximo ciclo."
     )
+
+# ══════════════════════════════════════════════════════════════════════════════
+# INFORME DE ESTADO
+# ══════════════════════════════════════════════════════════════════════════════
+async def _send_status_report(bot: Bot):
+    """
+    Envía un informe completo del estado del bot por Telegram.
+    Se llama al arrancar y cada día a las DAILY_REPORT_HOUR UTC.
+
+    Incluye:
+    · Modo (Simulación / Real)
+    · Balance total USDC
+    · Posiciones abiertas con precio de entrada, precio actual y P&L%
+    · Estado de la persistencia (ruta y existencia del fichero)
+    """
+    log.info("Generando informe de estado...")
+
+    # ── Modo y kill switch ────────────────────────────────────────────────────
+    mode_str = "🧪 SIMULACIÓN (sin dinero real)" if DRY_RUN else "🔴 MODO REAL"
+    ks_str   = (
+        f"⛔ Kill Switch ACTIVO — {state.get('kill_switch_reason', '')}"
+        if state.get("kill_switch")
+        else "✅ Operando con normalidad"
+    )
+
+    # ── Balance total ─────────────────────────────────────────────────────────
+    try:
+        total_bal = await _async(_fetch_total_portfolio_usdc)
+        bal_str   = f"{total_bal:.2f} USDC"
+    except Exception as e:
+        log.warning("Error obteniendo balance para informe: %s", e)
+        total_bal = 0.0
+        bal_str   = "No disponible (error de conexión)"
+
+    # ── Posiciones abiertas ───────────────────────────────────────────────────
+    positions = state.get("positions", {})
+    if positions:
+        pos_lines = []
+        for symbol, pos in positions.items():
+            entry = pos.get("entry_price", 0.0)
+            inv   = pos.get("invested", 0.0)
+            try:
+                cur_price = await _async(_fetch_price, symbol)
+                pnl_pct   = ((cur_price - entry) / entry * 100.0) if entry else 0.0
+                icon      = "📈" if pnl_pct >= 0 else "📉"
+                pos_lines.append(
+                    f"  {icon} {_coin_label(symbol)}\n"
+                    f"     Entrada: {entry:.4f}  |  Ahora: {cur_price:.4f}\n"
+                    f"     Invertido: {inv:.2f} USDC  |  P&L: {pnl_pct:+.2f}%"
+                )
+            except Exception:
+                pos_lines.append(
+                    f"  ⚪ {_coin_label(symbol)}\n"
+                    f"     Entrada: {entry:.4f}  |  Sin precio actual"
+                )
+        positions_str = "\n".join(pos_lines)
+    else:
+        positions_str = "  Sin posiciones abiertas."
+
+    # ── Persistencia ──────────────────────────────────────────────────────────
+    abs_path    = os.path.abspath(POSITIONS_FILE)
+    file_exists = os.path.exists(POSITIONS_FILE)
+    persist_str = (
+        f"✅ Activa — {abs_path}"
+        if file_exists
+        else f"⚠️ Archivo no encontrado — {abs_path}"
+    )
+
+    # ── P&L del día ───────────────────────────────────────────────────────────
+    pnl_hoy      = state.get("daily_realized_pnl", 0.0)
+    trades_hoy   = state.get("trades_today", 0)
+    last_scan    = state.get("last_scan", "Nunca")
+    hora_informe = datetime.now(timezone.utc).strftime("%d/%m/%Y %H:%M UTC")
+
+    msg = (
+        f"📊 Informe de estado — {hora_informe}\n"
+        f"{'─' * 34}\n"
+        f"Modo       : {mode_str}\n"
+        f"Estado     : {ks_str}\n"
+        f"Balance    : {bal_str}\n"
+        f"P&L hoy    : {pnl_hoy:+.2f} USDC  ({trades_hoy} operaciones)\n"
+        f"Últ. ciclo : {last_scan}\n"
+        f"\n"
+        f"Posiciones abiertas ({len(positions)}/{MAX_POSITIONS}):\n"
+        f"{positions_str}\n"
+        f"\n"
+        f"Persistencia:\n"
+        f"  {persist_str}"
+    )
+
+    await _notify(bot, msg)
+    log.info("Informe de estado enviado.")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BUCLE DE INFORME DIARIO — dispara una vez al día a las DAILY_REPORT_HOUR UTC
+# ══════════════════════════════════════════════════════════════════════════════
+async def daily_report_loop(bot: Bot):
+    """
+    Comprueba cada minuto si es la hora del informe diario (DAILY_REPORT_HOUR UTC).
+    Usa la fecha del día como guardia para disparar exactamente una vez por día.
+    El primer informe ya se envió en el arranque, así que inicializamos
+    last_report_date con la fecha actual para evitar un segundo envío inmediato.
+    """
+    last_report_date = date.today().isoformat()   # no repetir el informe de arranque
+    log.info("Daily report loop activo — informe diario a las %02d:00 UTC",
+             DAILY_REPORT_HOUR)
+
+    while True:
+        await asyncio.sleep(60)   # comprobar cada minuto — consumo mínimo de CPU
+        try:
+            now       = datetime.now(timezone.utc)
+            today_str = now.date().isoformat()
+
+            if (now.hour == DAILY_REPORT_HOUR
+                    and today_str != last_report_date):
+                log.info("Hora del informe diario (%02d:00 UTC)", DAILY_REPORT_HOUR)
+                await _send_status_report(bot)
+                last_report_date = today_str
+
+        except Exception as e:
+            log.error("Error en daily_report_loop: %s", e)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # EJECUCIÓN DE ÓRDENES
@@ -648,7 +689,6 @@ async def trading_loop(bot: Bot):
     log.info("━━━ CICLO %s ━━━", now.strftime("%d/%m %H:%M"))
     state["last_scan"] = now.isoformat()
 
-    # ── Saldo total ───────────────────────────────────────────────────────────
     try:
         total = await _async(_fetch_total_portfolio_usdc)
     except Exception as e:
@@ -668,20 +708,18 @@ async def trading_loop(bot: Bot):
         log.info("Posiciones llenas (%d/%d)", len(state["positions"]), MAX_POSITIONS)
         return
 
-    # ── Filtro BTC ────────────────────────────────────────────────────────────
     try:
         btc_chg = await _async(_fetch_btc_1h_change)
         btc_ok  = btc_chg > -BTC_DROP_BLOCK
         log.info("BTC 1h: %+.2f%% — %s", btc_chg, "OK" if btc_ok else "BLOQUEADO")
     except Exception as e:
         log.warning("Error filtro BTC: %s", e)
-        btc_ok = True   # si no podemos saber, seguimos (conservador)
+        btc_ok = True
 
     if not btc_ok:
         log.info("Filtro BTC: compras pausadas (BTC %.2f%%)", btc_chg)
         return
 
-    # ── Analizar WATCHLIST ────────────────────────────────────────────────────
     for symbol in WATCHLIST:
         if _slots_available() <= 0:
             break
@@ -689,7 +727,7 @@ async def trading_loop(bot: Bot):
             continue
 
         a = await _analyze(symbol)
-        await asyncio.sleep(0.5)   # cortesía con el rate limit de OKX
+        await asyncio.sleep(0.5)
 
         if not a:
             log.debug("%s — sin datos suficientes", symbol)
@@ -728,7 +766,6 @@ async def risk_loop(bot: Bot):
             if pnl_pct <= -STOP_LOSS_PCT:
                 log.warning("SL: %s %.2f%%", symbol, pnl_pct)
                 await _sell(symbol, pos, bot)
-
             elif pnl_pct >= TAKE_PROFIT_PCT:
                 log.info("TP: %s +%.2f%%", symbol, pnl_pct)
                 await _sell(symbol, pos, bot)
@@ -762,28 +799,32 @@ async def _run_risk_loop(bot: Bot):
             log.error("Error crítico en risk_loop: %s", e)
         await asyncio.sleep(RISK_LOOP_SEC)
 
+async def _run_daily_report_loop(bot: Bot):
+    await asyncio.sleep(60)   # esperar 1 min tras el arranque antes de activar
+    await daily_report_loop(bot)
+
 # ══════════════════════════════════════════════════════════════════════════════
 # ARRANQUE
 # ══════════════════════════════════════════════════════════════════════════════
 async def main():
     """
     Punto de entrada principal.
-    Verifica OKX en 3 pasos, arranca los bucles y envía el mensaje de bienvenida.
+    1. Verifica OKX (3 pasos).
+    2. Carga el estado persistido.
+    3. Envía informe de estado al arrancar.
+    4. Lanza trading_loop, risk_loop y daily_report_loop en background.
+    5. Mantiene el proceso vivo con un sleep infinito.
     """
     if not TELEGRAM_TOKEN:
         raise RuntimeError("TELEGRAM_TOKEN no configurado")
 
-    log.info("════ INICIANDO BOT v20.2.2 — OKX USDC WATCHER ════")
+    log.info("════ INICIANDO BOT v20.3 — OKX USDC WATCHER ════")
     log.info("Persistencia activada en: %s", os.path.abspath(POSITIONS_FILE))
 
-    # Construir el objeto Bot de Telegram (sin Application — no necesitamos comandos)
     bot = Bot(token=TELEGRAM_TOKEN)
 
     # ── Verificación OKX ──────────────────────────────────────────────────────
-    total_bal = 0.0
-    btc_ok    = True
     connected = False
-
     try:
         ex = get_exchange()
 
@@ -805,25 +846,11 @@ async def main():
             else:
                 log.warning("  ⚠️ %s NO encontrado en OKX — revisar símbolo", sym)
 
-        # Comprobar BTC para el mensaje de arranque
         btc_chg = await _async(_fetch_btc_1h_change)
-        btc_ok  = btc_chg > -BTC_DROP_BLOCK
         log.info("✅ [3/3] BTC 1h: %+.2f%%", btc_chg)
 
     except ccxt.AuthenticationError as e:
-        log.error("═══ [DIAG] AuthenticationError en arranque ═══")
-        log.error("  Mensaje completo OKX : %s", str(e))
-        log.error("  Tipo de excepción    : %s", type(e).__name__)
-        raw_args = getattr(e, "args", ())
-        for i, arg in enumerate(raw_args):
-            log.error("  args[%d]             : %s", i, arg)
-        log.error("  Hostname             : my.okx.com")
-        log.error("  sandbox              : False")
-        log.error("  API key presente     : %s", bool(OKX_API_KEY))
-        log.error("  Secret presente      : %s", bool(OKX_SECRET))
-        log.error("  Passphrase presente  : %s", bool(OKX_PASSPHRASE))
-        log.error("  Busca el código OKX numérico en el mensaje de arriba")
-        log.exception("  Traceback completo:")
+        log.error("❌ Error de autenticación OKX: %s", e)
         await bot.send_message(
             chat_id=CHAT_ID,
             text=(
@@ -837,34 +864,29 @@ async def main():
         log.error("❌ Error de red OKX: %s — intentando arrancar de todas formas", e)
 
     except Exception as e:
-        log.error("═══ [DIAG] Excepción inesperada en arranque ═══")
-        log.error("  Mensaje    : %s", str(e))
-        log.error("  Tipo       : %s", type(e).__name__)
-        raw_args = getattr(e, "args", ())
-        for i, arg in enumerate(raw_args):
-            log.error("  args[%d]   : %s", i, arg)
-        log.exception("  Traceback completo:")
+        log.error("❌ Error inesperado al conectar con OKX: %s", e)
 
     # ── Cargar estado previo ───────────────────────────────────────────────────
     load_state()
 
-    # ── Arrancar bucles ───────────────────────────────────────────────────────
+    # ── Arrancar los tres bucles de fondo ─────────────────────────────────────
     asyncio.create_task(_run_trading_loop(bot))
     asyncio.create_task(_run_risk_loop(bot))
+    asyncio.create_task(_run_daily_report_loop(bot))
 
-    # ── Mensaje de bienvenida ─────────────────────────────────────────────────
+    # ── Informe de estado al arrancar ─────────────────────────────────────────
+    # Sustituye al mensaje de bienvenida: da información real y útil desde el inicio.
     if connected:
-        await _msg_arranque(bot, total_bal, btc_ok)
+        await _send_status_report(bot)
     else:
         await _notify(bot,
-            "He arrancado pero tengo problemas para conectar con el exchange. "
+            "He arrancado pero tengo problemas para conectar con el exchange.\n"
             "Lo seguiré intentando automáticamente."
         )
 
     log.info("════ BOT LISTO — %s ════", "DRY RUN" if DRY_RUN else "MODO REAL")
 
     # ── Mantener el proceso vivo ───────────────────────────────────────────────
-    # (no usamos Application porque no hay comandos de Telegram)
     while True:
         await asyncio.sleep(3600)
 
