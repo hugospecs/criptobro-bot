@@ -1,7 +1,7 @@
 """
 CRYPTO BOT PRO v20.3 — OKX USDC Watcher (Europa)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Exchange  : OKX SPOT · my.okx.com · sandbox=False
+Exchange  : OKX SPOT · eea.okx.com · sandbox=False
 Moneda    : USDC
 Capital   : 25 USDC por operación · máx. 3 abiertas
 Vigilancia: SOL · FET · RENDER · NEAR · LINK
@@ -137,7 +137,7 @@ _exchange: Optional[ccxt.okx] = None
 def get_exchange() -> ccxt.okx:
     """
     Conector OKX SPOT — Mainnet Europa.
-    · hostname="my.okx.com"           → endpoint para usuarios europeos
+    · hostname="eea.okx.com"           → endpoint para usuarios europeos (EEA)
     · sandbox=False                    → red real, nunca demo
     · adjustForTimeDifference=True     → sincroniza el timestamp con OKX
                                          (evita rechazos por firma desfasada
@@ -153,7 +153,7 @@ def get_exchange() -> ccxt.okx:
             "secret":   OKX_SECRET,
             "password": OKX_PASSPHRASE,
             "sandbox":  False,
-            "hostname": "my.okx.com",
+            "hostname": "eea.okx.com",
             "options": {
                 "defaultType":             "spot",
                 "adjustForTimeDifference": True,
