@@ -533,20 +533,52 @@ def _execute_buy(symbol: str, usdc_amount: float) -> dict:
     }
 
 def _execute_sell(symbol: str, quantity: float) -> dict:
-    """Venta MARKET en OKX SPOT con tdMode='cash'."""
-    ex = get_exchange()
+    """
+    Venta MARKET en OKX SPOT con tdMode='cash'.
+
+    Fix comisiones: antes de vender, consulta al exchange la cantidad real
+    disponible del token. Si es menor que la cantidad en memoria (por las
+    comisiones de la compra), usa la cantidad real para evitar el error
+    "insufficient balance" de OKX.
+    Se aplica un margen adicional del 0.1% por si hubiera redondeos.
+    """
+    ex   = get_exchange()
+    coin = symbol.split("/")[0]   # "SOL" de "SOL/USDC"
+
     if DRY_RUN:
         price    = _fetch_price(symbol)
         order_id = f"DRY-SELL-{int(time.time())}"
         log.info("[DRY RUN] SELL %s qty=%.8f @ %.6f USDC", symbol, quantity, price)
     else:
+        # ── Consultar saldo real en el exchange ───────────────────────────────
+        try:
+            bal          = ex.fetch_balance()
+            real_qty     = float((bal.get(coin) or {}).get("free", 0.0) or 0.0)
+            if real_qty <= 0:
+                raise ValueError(f"Saldo real de {coin} es 0 en el exchange")
+
+            # Usar el mínimo entre lo que recuerda el bot y lo que hay realmente,
+            # con un pequeño margen del 0.1% para cubrir redondeos de precisión
+            sell_qty = min(quantity, real_qty * 0.999)
+            if sell_qty != quantity:
+                log.info(
+                    "SELL %s — cantidad ajustada por comisiones: "
+                    "memoria=%.8f  real=%.8f  venta=%.8f",
+                    symbol, quantity, real_qty, sell_qty
+                )
+        except Exception as e:
+            log.warning("No pude leer saldo real de %s, usando cantidad de memoria: %s",
+                        coin, e)
+            sell_qty = quantity
+
         order    = ex.create_market_sell_order(
-            symbol, quantity,
+            symbol, sell_qty,
             params={"tdMode": "cash"}
         )
         order_id = str(order.get("id", ""))
         exec_p   = order.get("average") or order.get("price")
         price    = float(exec_p) if exec_p else _fetch_price(symbol)
+        quantity = sell_qty   # actualizar para el cálculo de proceeds
         log.info("SELL OKX: %s id=%s qty=%.8f @ %.6f", symbol, order_id, quantity, price)
 
     return {
