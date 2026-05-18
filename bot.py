@@ -76,7 +76,7 @@ KILL_SWITCH_PCT     = 5.0   # kill switch diario
 TIMEFRAME          = "5m"
 OHLCV_LIMIT        = 60     # 60 velas de 5m = 5 horas de historia
 RSI_BUY            = 35     # RSI < 35 (más permisivo que v20.3)
-VOLUME_MULT        = 1.5    # volumen actual > avg_10 × 1.5
+VOLUME_MULT        = 1.2    # volumen actual > avg_10 × 1.2 (suavizado para 5m)
 VOLUME_LOOKBACK    = 10     # velas para calcular el volumen promedio
 BTC_DROP_BLOCK     = 1.0    # no comprar si BTC bajó > 1% en 1h
 
@@ -598,16 +598,41 @@ def _slots_available() -> int:
     return MAX_POSITIONS - len(state["positions"])
 
 def _reset_daily_if_needed(total: float):
+    """
+    Resetea las estadísticas diarias a las 00:00 UTC.
+
+    Fix persistencia / Railway restart:
+    Si el bot se reinicia en un día diferente al que tiene guardado en
+    state["daily_date"], sobreescribe daily_start_bal con el saldo actual.
+    Esto evita que el kill switch permanezca bloqueado indefinidamente
+    porque compara contra un saldo de ayer (o de hace varios días).
+
+    También resetea kill_switch=False al inicio de cada nuevo día para que
+    el bot pueda operar aunque ayer hubiera alcanzado el límite de pérdida.
+    """
     today = date.today().isoformat()
-    if state.get("daily_date") != today:
-        state["daily_date"]         = today
-        state["daily_start_bal"]    = total
-        state["daily_realized_pnl"] = 0.0
-        state["trades_today"]       = 0
-        state["wins_today"]         = 0
-        state["losses_today"]       = 0
-        log.info("Reset diario — saldo inicial: %.2f USDC", total)
-        save_state()
+    if state.get("daily_date") == today:
+        return   # mismo día — no hacer nada
+
+    log.info("Nuevo día detectado (anterior: %s → hoy: %s) — reseteando estadísticas",
+             state.get("daily_date", "ninguna"), today)
+
+    state["daily_date"]         = today
+    state["daily_start_bal"]    = total   # saldo real de este momento como referencia
+    state["daily_realized_pnl"] = 0.0
+    state["trades_today"]       = 0
+    state["wins_today"]         = 0
+    state["losses_today"]       = 0
+
+    # Reset del kill switch diario: el límite de pérdida es por día,
+    # no permanente. Al empezar un nuevo día se borra automáticamente.
+    if state.get("kill_switch") and "Drawdown" in state.get("kill_switch_reason", ""):
+        log.info("Kill switch de drawdown diario reseteado al inicio del nuevo día.")
+        state["kill_switch"]        = False
+        state["kill_switch_reason"] = ""
+
+    log.info("Reset diario completado — saldo inicial: %.2f USDC", total)
+    save_state()
 
 def _check_kill_switch(total: float) -> tuple[bool, float]:
     if state["kill_switch"]:
@@ -758,8 +783,14 @@ async def trading_loop(bot: Bot):
     killed, dd = _check_kill_switch(total)
     if killed:
         if dd > 0:
+            # Kill switch activado AHORA por pérdida diaria
+            log.warning("Kill switch activo: Límite de pérdida diaria superado "
+                        "(drawdown %.2f%% hoy, límite: %.1f%%).", dd, KILL_SWITCH_PCT)
             await _msg_kill_switch(bot, total, dd)
-        log.warning("Kill switch activo — ciclo omitido")
+        else:
+            # Kill switch ya estaba activo (cargado desde persistencia)
+            reason = state.get("kill_switch_reason", "razón desconocida")
+            log.warning("Kill switch activo: %s — ciclo omitido.", reason)
         return
 
     if _slots_available() <= 0:
