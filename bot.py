@@ -5,7 +5,7 @@ OKX USDC · eea.okx.com · 5m Scalping
 Exchange  : OKX SPOT · eea.okx.com · sandbox=False
 Moneda    : USDC
 Capital   : 25 USDC por operación · máx. 3 abiertas
-Watchlist : SOL · FET · RENDER · NEAR · LINK · PEPE · WIF
+Watchlist : NEAR · FET · RENDER · LINK · SOL (whitelist estricta)
 Timeframe : 5m (scalping agresivo)
 
 ESTRATEGIA — TRIPLE CONFIRMACIÓN:
@@ -57,7 +57,7 @@ POSITIONS_FILE = os.path.join(_DATA_PATH, "positions.json") if _DATA_PATH \
 
 # ── Timing ────────────────────────────────────────────────────────────────────
 TRADE_LOOP_SEC    = 300    # escaneo cada 5 minutos (scalping agresivo)
-RISK_LOOP_SEC     = 30     # vigilancia de riesgo cada 30 s (más reactivo)
+RISK_LOOP_SEC     = 60     # vigilancia de riesgo cada 60 s — suficiente para 5m
 DAILY_REPORT_HOUR = 16     # hora UTC del informe diario
 
 # ── Capital (en USDC) ─────────────────────────────────────────────────────────
@@ -80,16 +80,19 @@ VOLUME_MULT        = 1.2    # volumen actual > avg_10 × 1.2 (suavizado para 5m)
 VOLUME_LOOKBACK    = 10     # velas para calcular el volumen promedio
 BTC_DROP_BLOCK     = 1.0    # no comprar si BTC bajó > 1% en 1h
 
-# ── Watchlist expandida ───────────────────────────────────────────────────────
-WATCHLIST = [
-    "SOL/USDC",
+# ── Whitelist estricta — ÚNICOS símbolos que el bot puede comprar ─────────────
+# Modificar aquí para añadir o quitar monedas. El bot NUNCA comprará
+# ningún símbolo que no esté en esta lista.
+ALLOWED_SYMBOLS = [
+    "NEAR/USDC",
     "FET/USDC",
     "RENDER/USDC",
-    "NEAR/USDC",
     "LINK/USDC",
-    "PEPE/USDC",    # alta volatilidad — meme
-    "WIF/USDC",     # alta volatilidad — meme
+    "SOL/USDC",
 ]
+
+# Alias para compatibilidad — el bucle itera sobre ALLOWED_SYMBOLS
+WATCHLIST = ALLOWED_SYMBOLS
 
 COIN_NAMES = {
     "SOL/USDC":    "Solana",
@@ -97,8 +100,6 @@ COIN_NAMES = {
     "RENDER/USDC": "Render",
     "NEAR/USDC":   "NEAR Protocol",
     "LINK/USDC":   "Chainlink",
-    "PEPE/USDC":   "PEPE",
-    "WIF/USDC":    "dogwifhat",
 }
 
 logging.basicConfig(
@@ -158,7 +159,12 @@ def get_exchange() -> ccxt.okx:
     · hostname="eea.okx.com"           → endpoint regulado para usuarios europeos
     · sandbox=False                    → red real, nunca demo
     · adjustForTimeDifference=True     → sincroniza timestamp con OKX
-    · enableRateLimit=True             → CCXT gestiona el rate limit
+    · enableRateLimit=True             → CCXT impone espaciado estricto entre llamadas
+    · retries=5                        → reintenta silenciosamente hasta 5 veces
+                                         si un paquete se pierde o el servidor tarda
+    · networkTimeout=15000             → espera hasta 15 s por respuesta del server EEA
+                                         (el endpoint europeo puede ser más lento
+                                         que el global en horas de alta carga)
     · defaultType="spot"               → cuenta Trading, mercado Spot
     """
     global _exchange
@@ -169,11 +175,13 @@ def get_exchange() -> ccxt.okx:
             "password": OKX_PASSPHRASE,
             "sandbox":  False,
             "hostname": "eea.okx.com",
+            "enableRateLimit": True,
+            "retries":         5,
             "options": {
                 "defaultType":             "spot",
                 "adjustForTimeDifference": True,
+                "networkTimeout":          15000,
             },
-            "enableRateLimit": True,
         })
     return _exchange
 
@@ -688,6 +696,19 @@ async def _analyze(symbol: str) -> Optional[dict]:
 # ══════════════════════════════════════════════════════════════════════════════
 async def _buy(symbol: str, bot: Bot, reason: str) -> bool:
     """Ejecuta la compra y envía notificación."""
+    # ── Safety check previo: whitelist enforcement ────────────────────────────
+    if symbol not in ALLOWED_SYMBOLS:
+        log.critical("CRITICAL: Intento de compra de activo NO AUTORIZADO: %s — "
+                     "operación cancelada. Solo se permiten: %s",
+                     symbol, ALLOWED_SYMBOLS)
+        await _notify(bot,
+            f"🚨 ALERTA DE SEGURIDAD\n\n"
+            f"El bot intentó comprar {symbol}, que NO está en la whitelist.\n"
+            f"Operación CANCELADA automáticamente.\n"
+            f"Símbolos permitidos: {', '.join(ALLOWED_SYMBOLS)}"
+        )
+        return False
+
     if symbol in state["positions"] or _slots_available() <= 0:
         return False
 
@@ -712,6 +733,20 @@ async def _buy(symbol: str, bot: Bot, reason: str) -> bool:
     state["positions"][symbol] = result
     state["trades_today"]      = state.get("trades_today", 0) + 1
     save_state()
+
+    # ── Post-buy safety check ────────────────────────────────────────────────
+    # Última línea de defensa: si por algún motivo el símbolo comprado no
+    # está en ALLOWED_SYMBOLS, vender inmediatamente y alertar.
+    if symbol not in ALLOWED_SYMBOLS:
+        log.critical("CRITICAL: Buying unauthorized asset! %s — iniciando venta inmediata.",
+                     symbol)
+        await _notify(bot,
+            f"🚨 COMPRA DE ACTIVO NO AUTORIZADO DETECTADA\n\n"
+            f"Se compró {symbol} sin estar en la whitelist.\n"
+            f"Iniciando VENTA INMEDIATA para proteger el capital."
+        )
+        await _sell(symbol, result, bot, "Venta de emergencia: activo no autorizado")
+        return False
 
     try:
         total_bal = await _async(_fetch_total_portfolio_usdc)
@@ -810,8 +845,16 @@ async def trading_loop(bot: Bot):
         log.info("BTC Guard: compras pausadas (BTC %.2f%%)", btc_chg)
         return
 
-    # ── Escaneo WATCHLIST ─────────────────────────────────────────────────────
-    for symbol in WATCHLIST:
+    # ── Escaneo ALLOWED_SYMBOLS ───────────────────────────────────────────────
+    for symbol in ALLOWED_SYMBOLS:
+        # Guard de whitelist: rechazar cualquier símbolo no autorizado
+        # (defensa en profundidad por si ALLOWED_SYMBOLS fuera modificada
+        # accidentalmente o el estado cargara posiciones de sesiones anteriores)
+        if symbol not in ALLOWED_SYMBOLS:
+            log.warning("WHITELIST GUARD: símbolo %s ignorado — no está en ALLOWED_SYMBOLS",
+                        symbol)
+            continue
+
         if _slots_available() <= 0:
             break
         if symbol in state["positions"]:
@@ -917,6 +960,10 @@ async def _run_trading_loop(bot: Bot):
     while True:
         try:
             await trading_loop(bot)
+        except (ccxt.NetworkError, ccxt.RequestTimeout) as e:
+            # Error de red transitorio — no avisar por Telegram, solo log y continuar
+            log.warning("Trading loop — error de red transitorio (eea.okx.com): %s. "
+                        "Reintentando en el próximo ciclo.", type(e).__name__)
         except Exception as e:
             log.error("Error crítico en trading_loop: %s", e)
             await _msg_error_grave(bot, str(e))
@@ -928,6 +975,11 @@ async def _run_risk_loop(bot: Bot):
     while True:
         try:
             await risk_loop(bot)
+        except (ccxt.NetworkError, ccxt.RequestTimeout) as e:
+            # Error de red transitorio — las posiciones siguen abiertas y seguras,
+            # el SL/TP se comprobará en el próximo tick (60 s)
+            log.warning("Risk loop — error de red transitorio (eea.okx.com): %s. "
+                        "SL/TP se comprobará en el próximo tick.", type(e).__name__)
         except Exception as e:
             log.error("Error crítico en risk_loop: %s", e)
         await asyncio.sleep(RISK_LOOP_SEC)
@@ -963,8 +1015,8 @@ async def main():
                  free_usdc, total_bal)
         connected = True
 
-        log.info("[3/3] Verificando WATCHLIST en OKX...")
-        for sym in WATCHLIST:
+        log.info("[3/3] Verificando ALLOWED_SYMBOLS en OKX...")
+        for sym in ALLOWED_SYMBOLS:
             if sym in ex.markets:
                 log.info("  ✅ %s", sym)
             else:
