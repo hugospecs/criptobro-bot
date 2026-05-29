@@ -1,38 +1,39 @@
 """
-CRYPTO BOT PRO — ELITE HFT SCALPER V4
-OKX USDC · eea.okx.com · 1m scan / 10s risk
+CRYPTO BOT PRO — ELITE SCALPER V5 (MAX ALPHA)
+OKX USDC · eea.okx.com · 5m precision entries
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Exchange  : OKX SPOT · eea.okx.com · sandbox=False
-Moneda    : USDC
-Capital   : 25 USDC por operación · máx. 3 abiertas
-Watchlist : NEAR · FET · RENDER · LINK · SOL (whitelist estricta)
-Timeframe : 5m análisis / 1m escaneo / 10s risk
+Capital   : 25 USDC / trade · máx. 3 abiertas
+Watchlist : NEAR · FET · RENDER · LINK · SOL
 
-ESTRATEGIA — CUÁDRUPLE CONFIRMACIÓN:
-  1. EMA 200 (1h): precio > EMA200 en 1h (macro tendencia alcista)
-  2. RSI < 35 en 5m (sobreventa a corto plazo)
-  3. MACD bullish crossover en 5m
-  4. Volumen actual > promedio 10 velas × 1.2
+QUAD+ ENTRY SIGNAL (5 condiciones simultáneas):
+  1. EMA200 (1h) — precio > EMA200: evita tendencia bajista macro
+  2. RSI < 35 Y ASCENDENTE — rebote confirmado, no caída libre
+  3. MACD cruce CONFIRMADO (h0 >= 0) — no entradas prematuras
+  4. Volumen > media×1.2 — dinero real detrás
+  5. Vela 5m alcista (close > open) — price action confirma el momento
 
-RIESGO ESCALADO:
-  · SL inicial: -1.5%
-  · Step 1: max_pnl >= +1.0% → SL sube a +0.1% (break-even)
-  · Step 2: max_pnl >= +2.5% → SL sube a +1.2%
-  · Step 3: max_pnl >= +3.8% → SL sube a +2.5%
-  · TP servidor: orden límite a +4.5% colocada en OKX al instante
-    (0ms delay, comisiones maker más bajas)
-  · Kill Switch diario: -5%
-  · BTC Guard: pausa si BTC cae > 1% en 1h
+SUPRESIONES ESTRATÉGICAS (anti-feedo):
+  · MACD "turning" ELIMINADO — causaba entradas en falso antes del cruce
+  · RSI sin dirección ELIMINADO — filtraba activos en caída sostenida
+  · Cooldown 30 min/símbolo tras SL — evita reentrar en la misma trampa
 
-VELOCIDAD:
-  · Scan de entradas: cada 60 s
-  · Monitor de riesgo: cada 10 s (fetch_tickers batch, mínimas llamadas)
+ESCALATED TRAILING:
+  · SL inicial: -2.2% (respira ante volatilidad cripto normal)
+  · Step 1: max_pnl >= 1.5% → SL = +0.2% (break-even + fees)
+  · Step 2: max_pnl >= 2.5% → SL = +1.0% (profit parcial asegurado)
+  · Step 3: max_pnl >= 3.5% → SL = +2.0% (guarda el pico)
+  · TP server-side: +4.5% (orden límite en OKX, fee maker)
+
+TIMING:
+  · Scan entradas: 5 min (evita overtrading y fee-bleeding)
+  · Risk monitor:  15 s via batch fetch_tickers()
 
 VARIABLES DE ENTORNO:
   TELEGRAM_TOKEN, CHAT_ID
   OKX_API_KEY, OKX_SECRET_KEY, OKX_PASSPHRASE
   DRY_RUN=true
-  DATA_PATH=/app/data  (Railway Volume — opcional)
+  DATA_PATH=/app/data
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
@@ -60,37 +61,38 @@ POSITIONS_FILE = os.path.join(_DATA_PATH, "positions.json") if _DATA_PATH \
                  else "positions.json"
 
 # ── Timing ────────────────────────────────────────────────────────────────────
-TRADE_LOOP_SEC    = 60     # escaneo de entradas cada 1 minuto
-RISK_LOOP_SEC     = 10     # monitor de riesgo cada 10 segundos
-DAILY_REPORT_HOUR = 16     # hora UTC del informe diario
+TRADE_LOOP_SEC    = 300    # 5 min — captura tendencias reales, evita fee-bleeding
+RISK_LOOP_SEC     = 15     # 15 s — vigilancia rápida sin saturar OKX
+DAILY_REPORT_HOUR = 16
 
-# ── Capital (en USDC) ─────────────────────────────────────────────────────────
+# ── Capital (USDC) ────────────────────────────────────────────────────────────
 TRADE_USDC     = 25.0
 MAX_POSITIONS  = 3
 MIN_TRADE_USDC = 5.0
 
-# ── Riesgo escalado ───────────────────────────────────────────────────────────
-STOP_LOSS_PCT   = 1.5    # SL inicial más ajustado para HFT
-TAKE_PROFIT_PCT = 4.5    # TP colocado como orden límite en el servidor
+# ── Riesgo ────────────────────────────────────────────────────────────────────
+STOP_LOSS_PCT   = 2.2    # más holgura para respirar ante volatilidad normal
+TAKE_PROFIT_PCT = 4.5    # TP como orden límite en servidor OKX
 
-# Escalones del trailing stop (max_pnl alcanzado → nuevo SL)
+# Escalones trailing — SL solo sube, nunca baja
 TRAIL_STEPS = [
-    (1.0, 0.1),   # max_pnl >= 1.0% → SL = +0.1% (break-even)
-    (2.5, 1.2),   # max_pnl >= 2.5% → SL = +1.2%
-    (3.8, 2.5),   # max_pnl >= 3.8% → SL = +2.5%
+    (1.5, 0.2),   # max_pnl >= +1.5% → SL = +0.2% (break-even + fees)
+    (2.5, 1.0),   # max_pnl >= +2.5% → SL = +1.0% (profit parcial)
+    (3.5, 2.0),   # max_pnl >= +3.5% → SL = +2.0% (guarda el pico)
 ]
 
-KILL_SWITCH_PCT = 5.0    # kill switch si drawdown diario > 5%
+KILL_SWITCH_PCT = 5.0
 
 # ── Estrategia ────────────────────────────────────────────────────────────────
-TIMEFRAME       = "5m"
-OHLCV_LIMIT     = 60     # 60 velas × 5m = 5h de historia
-EMA200_TF       = "1h"   # timeframe del filtro macro EMA200
-EMA200_LIMIT    = 210    # velas 1h para calcular la EMA200 con precisión
-RSI_BUY         = 35
-VOLUME_MULT     = 1.2
-VOLUME_LOOKBACK = 10
-BTC_DROP_BLOCK  = 1.0    # no comprar si BTC cae > 1% en 1h
+TIMEFRAME        = "5m"
+OHLCV_LIMIT      = 80     # 80 velas × 5m = ~6.5h de historia (más contexto MACD)
+EMA200_TF        = "1h"
+EMA200_LIMIT     = 210
+RSI_BUY          = 35
+VOLUME_MULT      = 1.2
+VOLUME_LOOKBACK  = 10
+BTC_DROP_BLOCK   = 1.0    # pausa si BTC cae > 1% en 1h
+SL_COOLDOWN_SEC  = 1800   # 30 min de cooldown por símbolo tras un SL
 
 # ── Whitelist estricta ────────────────────────────────────────────────────────
 ALLOWED_SYMBOLS = [
@@ -100,7 +102,7 @@ ALLOWED_SYMBOLS = [
     "LINK/USDC",
     "SOL/USDC",
 ]
-WATCHLIST = ALLOWED_SYMBOLS   # alias
+WATCHLIST = ALLOWED_SYMBOLS
 
 COIN_NAMES = {
     "SOL/USDC":    "Solana",
@@ -120,8 +122,6 @@ log = logging.getLogger(__name__)
 # ESTADO GLOBAL
 # ══════════════════════════════════════════════════════════════════════════════
 state: dict = {
-    # symbol → {entry_price, quantity, invested, peak_price, entry_time,
-    #            order_id, sl_pct, max_pnl, tp_order_id}
     "positions":          {},
     "kill_switch":        False,
     "kill_switch_reason": "",
@@ -132,6 +132,8 @@ state: dict = {
     "wins_today":         0,
     "losses_today":       0,
     "last_scan":          "Nunca",
+    # cooldown: {symbol: timestamp_unix_ultimo_SL}
+    "sl_cooldown":        {},
 }
 
 def load_state():
@@ -139,13 +141,11 @@ def load_state():
         try:
             with open(POSITIONS_FILE) as f:
                 state.update(json.load(f))
-            log.info("Estado cargado — %d posiciones abiertas",
-                     len(state["positions"]))
+            log.info("Estado cargado — %d posiciones", len(state["positions"]))
         except Exception as e:
             log.warning("Error cargando estado: %s", e)
 
 def save_state():
-    """Escritura atómica — nunca deja el JSON corrupto."""
     try:
         target_dir = os.path.dirname(os.path.abspath(POSITIONS_FILE))
         os.makedirs(target_dir, exist_ok=True)
@@ -162,12 +162,6 @@ def save_state():
 _exchange: Optional[ccxt.okx] = None
 
 def get_exchange() -> ccxt.okx:
-    """
-    OKX SPOT EEA con:
-    · retries=5          → reintenta si la red cae
-    · networkTimeout=15s → espera hasta 15 s por respuesta EEA
-    · enableRateLimit    → CCXT gestiona spacing entre llamadas
-    """
     global _exchange
     if _exchange is None:
         _exchange = ccxt.okx({
@@ -201,14 +195,22 @@ def _ema(prices: list, period: int) -> float:
         e = float(p) * k + e * (1.0 - k)
     return e
 
-def _rsi(closes: list, period: int = 14) -> float:
-    if len(closes) < period + 1:
-        return 50.0
+def _rsi_series(closes: list, period: int = 14) -> list:
+    """Devuelve la serie RSI completa (útil para detectar dirección)."""
+    if len(closes) < period + 2:
+        return [50.0, 50.0]
+    result = []
     deltas = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
-    gains  = [max(d,  0.0) for d in deltas[-period:]]
-    losses = [max(-d, 0.0) for d in deltas[-period:]]
-    ag, al = sum(gains) / period, sum(losses) / period
-    return 100.0 if al == 0 else round(100.0 - 100.0 / (1.0 + ag / al), 2)
+    for i in range(period, len(deltas)):
+        g = [max(d, 0.0) for d in deltas[i - period:i]]
+        l = [max(-d, 0.0) for d in deltas[i - period:i]]
+        ag, al = sum(g) / period, sum(l) / period
+        result.append(100.0 if al == 0 else round(100.0 - 100.0 / (1.0 + ag / al), 2))
+    return result if result else [50.0, 50.0]
+
+def _rsi(closes: list, period: int = 14) -> float:
+    s = _rsi_series(closes, period)
+    return s[-1] if s else 50.0
 
 def _macd_histogram_series(closes: list) -> list:
     if len(closes) < 35:
@@ -225,14 +227,48 @@ def _macd_histogram_series(closes: list) -> list:
         return []
     return [m - s for m, s in zip(macd_vals[8:], signal_vals)]
 
-def _macd_bullish(closes: list) -> bool:
+def _macd_confirmed_crossover(closes: list) -> bool:
+    """
+    SOLO cruce alcista CONFIRMADO: h[-1] >= 0 Y h[-2] < 0.
+    
+    SUPRESIÓN ESTRATÉGICA: eliminamos la condición "turning" (histograma
+    negativo pero creciendo) que estaba en versiones anteriores.
+    Esa condición generaba entradas prematuras antes de que el cruce
+    se materializara, resultando en compras en medio de caídas.
+    Ahora solo entramos cuando el MACD ha cruzado al alza de forma confirmada.
+    """
     hist = _macd_histogram_series(closes)
-    if len(hist) < 3:
+    if len(hist) < 2:
         return False
-    h0, h1, h2 = hist[-1], hist[-2], hist[-3]
-    cross_up = h1 < 0.0 <= h0
-    turning  = h0 < 0.0 and h0 > h1 > h2
-    return cross_up or turning
+    h0, h1 = hist[-1], hist[-2]
+    return h1 < 0.0 and h0 >= 0.0   # cruce real: negativo → positivo
+
+def _rsi_ascending(closes: list, period: int = 14) -> bool:
+    """
+    RSI ascendente: RSI[-1] > RSI[-2].
+    
+    ADICIÓN ESTRATÉGICA: filtra activos cuyo RSI está por debajo del umbral
+    pero continúa cayendo (caída libre). Solo compramos cuando el RSI ya
+    ha tocado suelo y está subiendo — confirma que el rebote ha comenzado.
+    """
+    s = _rsi_series(closes, period)
+    if len(s) < 2:
+        return False
+    return s[-1] > s[-2]
+
+def _bullish_candle(ohlcv: list) -> bool:
+    """
+    Vela 5m actual alcista: close > open.
+    
+    ADICIÓN ESTRATÉGICA: price action confirma el momento exacto de entrada.
+    Evitamos entrar en medio de una vela roja aunque todos los demás
+    indicadores sean positivos. Una vela verde en el momento de la señal
+    es la confirmación final de que el precio está moviendo en nuestra dirección.
+    """
+    if not ohlcv:
+        return False
+    last = ohlcv[-1]
+    return float(last[4]) > float(last[1])   # close > open
 
 def _volume_filter(ohlcv: list) -> bool:
     if len(ohlcv) < VOLUME_LOOKBACK + 1:
@@ -248,15 +284,9 @@ def _volume_filter(ohlcv: list) -> bool:
     return passes
 
 def _ema200_above(ohlcv_1h: list, current_price: float) -> bool:
-    """
-    True si current_price está ESTRICTAMENTE por encima de la EMA200 en 1h.
-    Requiere al menos 200 velas de 1h. Si no hay suficientes datos,
-    se permite la operación por defecto (conservador ante la falta de datos).
-    """
+    """Precio > EMA200 en 1h: macro tendencia alcista."""
     if len(ohlcv_1h) < 200:
-        log.debug("EMA200: datos insuficientes (%d velas) — omitiendo filtro",
-                  len(ohlcv_1h))
-        return True
+        return True   # sin suficientes datos, no bloqueamos
     closes_1h = [float(c[4]) for c in ohlcv_1h]
     ema200    = _ema(closes_1h, 200)
     above     = current_price > ema200
@@ -274,23 +304,19 @@ def _round_step(value: float, step: float) -> float:
     return round(math.floor(value / step) * step, dec)
 
 def _price_step(symbol: str) -> float:
-    """Paso mínimo de precio (tick size) del mercado."""
-    ex = get_exchange()
-    market = ex.markets.get(symbol, {})
+    market = get_exchange().markets.get(symbol, {})
     p = market.get("precision", {}).get("price")
     return p if p and p > 0 else 0.0001
 
 def _fetch_usdc_free() -> float:
-    ex  = get_exchange()
-    bal = ex.fetch_balance()
+    bal = get_exchange().fetch_balance()
     return float((bal.get("USDC") or {}).get("free", 0.0) or 0.0)
 
 def _fetch_total_portfolio_usdc() -> float:
     ex    = get_exchange()
     bal   = ex.fetch_balance()
     total = float((bal.get("USDC") or {}).get("total", 0.0) or 0.0)
-    skip  = {"USDC", "USDT", "info", "free", "used", "total",
-             "timestamp", "datetime"}
+    skip  = {"USDC", "USDT", "info", "free", "used", "total", "timestamp", "datetime"}
     for coin, amounts in bal.items():
         if coin in skip:
             continue
@@ -309,24 +335,16 @@ def _fetch_total_portfolio_usdc() -> float:
     return total
 
 def _fetch_tickers_batch(symbols: list) -> dict:
-    """
-    fetch_tickers() para un conjunto de símbolos en una sola llamada.
-    Retorna {symbol: last_price}. Más eficiente que N×fetch_ticker().
-    """
-    ex      = get_exchange()
-    tickers = ex.fetch_tickers(symbols)
-    return {sym: float(tk.get("last") or 0.0)
-            for sym, tk in tickers.items()}
+    """Una sola llamada API para todos los precios activos."""
+    tickers = get_exchange().fetch_tickers(symbols)
+    return {sym: float(tk.get("last") or 0.0) for sym, tk in tickers.items()}
 
-def _fetch_ohlcv(symbol: str, tf: str = "5m",
-                  limit: int = OHLCV_LIMIT) -> list:
-    ex    = get_exchange()
-    ohlcv = ex.fetch_ohlcv(symbol, tf, limit=limit)
+def _fetch_ohlcv(symbol: str, tf: str = "5m", limit: int = OHLCV_LIMIT) -> list:
+    ohlcv = get_exchange().fetch_ohlcv(symbol, tf, limit=limit)
     return ohlcv if ohlcv else []
 
 def _fetch_price(symbol: str) -> float:
-    ex = get_exchange()
-    return float((ex.fetch_ticker(symbol).get("last")) or 0.0)
+    return float((get_exchange().fetch_ticker(symbol).get("last")) or 0.0)
 
 def _fetch_btc_1h_change() -> float:
     ex = get_exchange()
@@ -341,62 +359,45 @@ def _fetch_btc_1h_change() -> float:
             continue
     return 0.0
 
-def _place_tp_limit_order(symbol: str, quantity: float,
-                           entry_price: float) -> str:
-    """
-    Coloca una orden límite de VENTA a +TAKE_PROFIT_PCT% directamente en OKX.
-    Garantiza ejecución instantánea con fee de maker (más barato que taker).
-    Devuelve el order_id o "" si DRY_RUN o si falla.
-    """
-    tp_price = round(entry_price * (1 + TAKE_PROFIT_PCT / 100.0),
-                     8)
-    # Redondear al tick size del mercado
-    tick = _price_step(symbol)
+def _place_tp_limit_order(symbol: str, quantity: float, entry_price: float) -> str:
+    """TP a +4.5% como orden límite en OKX — fee maker, ejecución instantánea."""
+    tp_price = round(entry_price * (1 + TAKE_PROFIT_PCT / 100.0), 8)
+    tick     = _price_step(symbol)
     if tick > 0:
         tp_price = _round_step(tp_price, tick)
 
     if DRY_RUN:
-        fake_id = f"DRY-TP-{int(time.time())}"
-        log.info("[DRY RUN] TP limit order: %s qty=%.8f @ %.6f (+%.1f%%)",
-                 symbol, quantity, tp_price, TAKE_PROFIT_PCT)
-        return fake_id
+        oid = f"DRY-TP-{int(time.time())}"
+        log.info("[DRY RUN] TP limit: %s @ %.6f (+%.1f%%)", symbol, tp_price, TAKE_PROFIT_PCT)
+        return oid
 
     try:
-        ex    = get_exchange()
-        order = ex.create_limit_sell_order(
+        order = get_exchange().create_limit_sell_order(
             symbol, quantity, tp_price,
             params={"tdMode": "cash"}
         )
         oid = str(order.get("id", ""))
-        log.info("TP limit order colocada: %s id=%s @ %.6f", symbol, oid, tp_price)
+        log.info("TP limit colocada: %s id=%s @ %.6f", symbol, oid, tp_price)
         return oid
     except Exception as e:
-        log.warning("No pude colocar TP limit order para %s: %s", symbol, e)
+        log.warning("No pude colocar TP limit para %s: %s", symbol, e)
         return ""
 
 def _cancel_order(symbol: str, order_id: str) -> bool:
-    """
-    Cancela una orden abierta en OKX. Necesario antes de hacer market sell
-    cuando el trailing stop se activa (evita doble venta).
-    Devuelve True si se canceló correctamente.
-    """
     if not order_id or order_id.startswith("DRY-"):
-        return True   # en DRY_RUN no hay nada real que cancelar
-
+        return True
     try:
-        ex = get_exchange()
-        ex.cancel_order(order_id, symbol)
+        get_exchange().cancel_order(order_id, symbol)
         log.info("Orden cancelada: %s id=%s", symbol, order_id)
         return True
     except ccxt.OrderNotFound:
-        log.info("Orden %s ya ejecutada o no existe — continuando", order_id)
-        return True   # puede que el TP ya se ejecutó — no es error
+        return True   # ya ejecutada — no es error
     except Exception as e:
-        log.warning("Error cancelando orden %s para %s: %s", order_id, symbol, e)
+        log.warning("Error cancelando %s para %s: %s", order_id, symbol, e)
         return False
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TELEGRAM — MENSAJES
+# TELEGRAM
 # ══════════════════════════════════════════════════════════════════════════════
 async def _notify(bot: Bot, text: str):
     if not CHAT_ID:
@@ -404,255 +405,119 @@ async def _notify(bot: Bot, text: str):
     try:
         await bot.send_message(chat_id=CHAT_ID, text=text)
     except Exception as e:
-        log.error("Error enviando Telegram: %s", e)
+        log.error("Telegram: %s", e)
 
 def _coin_label(symbol: str) -> str:
     return COIN_NAMES.get(symbol, symbol.split("/")[0])
 
 async def _msg_compra(bot: Bot, symbol: str, invested: float,
-                      price: float, total_bal: float, reason: str,
-                      tp_price: float):
-    label    = _coin_label(symbol)
-    dry_note = "⚠️ [SIMULACIÓN]\n\n" if DRY_RUN else ""
+                      price: float, total_bal: float, reason: str, tp_price: float):
+    dry = "⚠️ [SIMULACIÓN]\n\n" if DRY_RUN else ""
     await _notify(bot,
-        f"{dry_note}"
-        f"👀 He comprado {label} usando {invested:.0f} dólares.\n"
-        f"Precio entrada: {price:.5f} USDC\n"
+        f"{dry}👀 Compré {_coin_label(symbol)} — {invested:.0f} USDC\n"
+        f"Entrada: {price:.5f}\n"
         f"Señal: {reason}\n"
-        f"🎯 TP en servidor: {tp_price:.5f} (+{TAKE_PROFIT_PCT}%)\n"
-        f"🛑 SL inicial: -{STOP_LOSS_PCT}%\n\n"
-        f"💰 Total ahora: {total_bal:.2f} USDC"
+        f"🎯 TP servidor: {tp_price:.5f} (+{TAKE_PROFIT_PCT}%)\n"
+        f"🛑 SL: -{STOP_LOSS_PCT}%\n\n"
+        f"💰 Total: {total_bal:.2f} USDC"
     )
 
 async def _msg_venta_ganancia(bot: Bot, symbol: str, pnl: float,
                                total_bal: float, motivo: str):
-    label    = _coin_label(symbol)
-    dry_note = "⚠️ [SIMULACIÓN]\n\n" if DRY_RUN else ""
+    dry = "⚠️ [SIMULACIÓN]\n\n" if DRY_RUN else ""
     await _notify(bot,
-        f"{dry_note}"
-        f"🎉 ¡Ganancia! Vendí {label} y hemos ganado {pnl:.2f} dólares.\n"
-        f"({motivo})\n\n"
-        f"💰 Total ahora: {total_bal:.2f} USDC"
+        f"{dry}🎉 Ganancia en {_coin_label(symbol)}: +{pnl:.2f} USDC\n"
+        f"({motivo})\n\n💰 Total: {total_bal:.2f} USDC"
     )
 
 async def _msg_venta_perdida(bot: Bot, symbol: str, pnl: float,
                               total_bal: float, motivo: str):
-    label    = _coin_label(symbol)
-    dry_note = "⚠️ [SIMULACIÓN]\n\n" if DRY_RUN else ""
+    dry = "⚠️ [SIMULACIÓN]\n\n" if DRY_RUN else ""
     await _notify(bot,
-        f"{dry_note}"
-        f"😔 Vendí {label} con pérdida de {abs(pnl):.2f} dólares.\n"
-        f"({motivo})\n\n"
-        f"💰 Total ahora: {total_bal:.2f} USDC"
+        f"{dry}😔 Pérdida en {_coin_label(symbol)}: {pnl:.2f} USDC\n"
+        f"({motivo})\n\n💰 Total: {total_bal:.2f} USDC"
     )
 
 async def _msg_kill_switch(bot: Bot, total_bal: float, drawdown: float):
     await _notify(bot,
-        f"🛑 He pausado las compras. El dinero bajó {drawdown:.1f}% hoy.\n\n"
-        f"💰 Total ahora: {total_bal:.2f} USDC\n\n"
-        f"Se reiniciará mañana automáticamente."
+        f"🛑 Kill switch: bajé {drawdown:.1f}% hoy.\n"
+        f"💰 Total: {total_bal:.2f} USDC\n\nReinicio mañana."
     )
 
 async def _msg_error_grave(bot: Bot, motivo: str):
-    await _notify(bot,
-        f"⚠️ Problema técnico — siguiente ciclo lo reintentará.\n\n"
-        f"Motivo: {motivo}"
-    )
+    await _notify(bot, f"⚠️ Error técnico — reintentando.\nMotivo: {motivo}")
 
 async def _msg_sl_step(bot: Bot, symbol: str, step: int,
-                        new_sl: float, pnl_pct: float):
-    label    = _coin_label(symbol)
-    dry_note = "⚠️ [SIMULACIÓN]\n\n" if DRY_RUN else ""
+                        new_sl: float, max_pnl: float):
+    dry = "⚠️ [SIMULACIÓN]\n\n" if DRY_RUN else ""
     await _notify(bot,
-        f"{dry_note}"
-        f"🔒 Step {step} trailing en {label}\n"
-        f"P&L máximo: +{pnl_pct:.2f}%\n"
-        f"SL movido a: +{new_sl:.1f}% (protegiendo capital)"
+        f"{dry}🔒 Trailing Step {step} — {_coin_label(symbol)}\n"
+        f"Pico: +{max_pnl:.2f}% → SL movido a +{new_sl:.1f}%"
     )
 
 # ══════════════════════════════════════════════════════════════════════════════
 # INFORME DE ESTADO
 # ══════════════════════════════════════════════════════════════════════════════
 async def _send_status_report(bot: Bot):
-    log.info("Generando informe de estado...")
-
-    mode_str = "🧪 SIMULACIÓN" if DRY_RUN else "🔴 MODO REAL"
-    ks_str   = (
-        f"⛔ Kill Switch ACTIVO — {state.get('kill_switch_reason', '')}"
-        if state.get("kill_switch") else "✅ Operando"
-    )
+    log.info("Generando informe...")
+    mode_str = "🧪 SIMULACIÓN" if DRY_RUN else "🔴 REAL"
+    ks_str   = (f"⛔ Kill Switch — {state.get('kill_switch_reason','')}"
+                if state.get("kill_switch") else "✅ Operando")
 
     try:
         total_bal = await _async(_fetch_total_portfolio_usdc)
         bal_str   = f"{total_bal:.2f} USDC"
-    except Exception as e:
-        log.warning("Error obteniendo balance: %s", e)
+    except Exception:
         total_bal, bal_str = 0.0, "No disponible"
 
     positions = state.get("positions", {})
-    if positions:
-        pos_lines = []
-        for symbol, pos in positions.items():
-            entry  = pos.get("entry_price", 0.0)
-            inv    = pos.get("invested", 0.0)
-            sl_pct = pos.get("sl_pct", -STOP_LOSS_PCT)
-            tp_oid = pos.get("tp_order_id", "")
-            try:
-                cur_price = await _async(_fetch_price, symbol)
-                pnl_pct   = ((cur_price - entry) / entry * 100.0) if entry else 0.0
-                icon      = "📈" if pnl_pct >= 0 else "📉"
-                tp_tag    = " 🎯TP-server" if tp_oid else ""
-                pos_lines.append(
-                    f"  {icon} {_coin_label(symbol)}{tp_tag}\n"
-                    f"     Entrada: {entry:.5f} | Ahora: {cur_price:.5f}\n"
-                    f"     Invertido: {inv:.2f} USDC | P&L: {pnl_pct:+.2f}%\n"
-                    f"     SL activo: {sl_pct:+.1f}%"
-                )
-            except Exception:
-                pos_lines.append(f"  ⚪ {_coin_label(symbol)} | Sin precio")
-        positions_str = "\n".join(pos_lines)
-    else:
-        positions_str = "  Sin posiciones abiertas."
+    pos_lines = []
+    for symbol, pos in positions.items():
+        entry  = pos.get("entry_price", 0.0)
+        inv    = pos.get("invested", 0.0)
+        sl_pct = pos.get("sl_pct", -STOP_LOSS_PCT)
+        tp_oid = pos.get("tp_order_id", "")
+        try:
+            p       = await _async(_fetch_price, symbol)
+            pct     = ((p - entry) / entry * 100.0) if entry else 0.0
+            icon    = "📈" if pct >= 0 else "📉"
+            tp_tag  = " 🎯TP-svr" if tp_oid else ""
+            pos_lines.append(
+                f"  {icon} {_coin_label(symbol)}{tp_tag}\n"
+                f"     {entry:.5f}→{p:.5f} | {inv:.2f}USDC | P&L:{pct:+.2f}%\n"
+                f"     SL:{sl_pct:+.1f}%"
+            )
+        except Exception:
+            pos_lines.append(f"  ⚪ {_coin_label(symbol)} | Sin precio")
 
-    wins         = state.get("wins_today", 0)
-    losses       = state.get("losses_today", 0)
-    total_closed = wins + losses
-    success_rate = (
-        f"{wins}/{total_closed} ({wins/total_closed*100:.0f}%)"
-        if total_closed > 0 else "Sin operaciones cerradas hoy"
-    )
-    abs_path    = os.path.abspath(POSITIONS_FILE)
-    persist_str = (
-        f"✅ {abs_path}" if os.path.exists(POSITIONS_FILE)
-        else f"⚠️ No encontrado — {abs_path}"
-    )
-    hora = datetime.now(timezone.utc).strftime("%d/%m/%Y %H:%M UTC")
+    wins   = state.get("wins_today", 0)
+    losses = state.get("losses_today", 0)
+    tc     = wins + losses
+    sr     = f"{wins}/{tc} ({wins/tc*100:.0f}%)" if tc else "—"
+    hora   = datetime.now(timezone.utc).strftime("%d/%m %H:%M UTC")
 
     msg = (
-        f"📊 Informe — {hora}\n"
-        f"{'─' * 34}\n"
-        f"Modo       : {mode_str}\n"
-        f"Estado     : {ks_str}\n"
-        f"Equity     : {bal_str}\n"
-        f"P&L hoy    : {state.get('daily_realized_pnl', 0.0):+.2f} USDC\n"
-        f"Éxito hoy  : {success_rate}\n"
-        f"Últ. ciclo : {state.get('last_scan', 'Nunca')}\n\n"
+        f"📊 {hora}\n{'─'*32}\n"
+        f"Modo: {mode_str} | {ks_str}\n"
+        f"Equity: {bal_str} | P&L hoy: {state.get('daily_realized_pnl',0):+.2f}\n"
+        f"Éxito: {sr}\n\n"
         f"Posiciones ({len(positions)}/{MAX_POSITIONS}):\n"
-        f"{positions_str}\n\n"
-        f"Persistencia: {persist_str}"
+        + ("\n".join(pos_lines) if pos_lines else "  Sin posiciones.")
+        + f"\n\nPersistencia: {os.path.abspath(POSITIONS_FILE)}"
     )
     await _notify(bot, msg)
-    log.info("Informe enviado.")
 
-# ══════════════════════════════════════════════════════════════════════════════
-# BUCLE DE INFORME DIARIO
-# ══════════════════════════════════════════════════════════════════════════════
 async def daily_report_loop(bot: Bot):
-    last_report_date = date.today().isoformat()
-    log.info("Daily report loop activo — informe a las %02d:00 UTC", DAILY_REPORT_HOUR)
+    last = date.today().isoformat()
     while True:
         await asyncio.sleep(60)
         try:
-            now       = datetime.now(timezone.utc)
-            today_str = now.date().isoformat()
-            if now.hour == DAILY_REPORT_HOUR and today_str != last_report_date:
+            now = datetime.now(timezone.utc)
+            if now.hour == DAILY_REPORT_HOUR and now.date().isoformat() != last:
                 await _send_status_report(bot)
-                last_report_date = today_str
+                last = now.date().isoformat()
         except Exception as e:
-            log.error("Error en daily_report_loop: %s", e)
-
-# ══════════════════════════════════════════════════════════════════════════════
-# EJECUCIÓN DE ÓRDENES
-# ══════════════════════════════════════════════════════════════════════════════
-def _execute_buy(symbol: str, usdc_amount: float) -> dict:
-    """Compra MARKET en OKX SPOT. Devuelve dict de posición."""
-    ex     = get_exchange()
-    market = ex.markets.get(symbol, {})
-    price  = _fetch_price(symbol)
-    if price <= 0:
-        raise ValueError(f"Precio inválido para {symbol}")
-
-    lot_step = (
-        market.get("precision", {}).get("amount")
-        or (market.get("limits") or {}).get("amount", {}).get("min", 0.0001)
-        or 0.0001
-    )
-    quantity = _round_step(usdc_amount / price, lot_step)
-    min_qty  = ((market.get("limits") or {}).get("amount") or {}).get("min") or 0.0
-    if quantity < min_qty:
-        quantity = _round_step(min_qty * 1.05, lot_step)
-
-    if DRY_RUN:
-        order_id   = f"DRY-BUY-{int(time.time())}"
-        exec_price = price
-        log.info("[DRY RUN] BUY %s qty=%.8f @ %.6f", symbol, quantity, price)
-    else:
-        try:
-            order = ex.createMarketBuyOrderWithCost(
-                symbol, usdc_amount, params={"tdMode": "cash"}
-            )
-        except (ccxt.NotSupported, AttributeError):
-            order = ex.create_market_buy_order(
-                symbol, quantity, params={"tdMode": "cash"}
-            )
-        order_id   = str(order.get("id", ""))
-        exec_price = float(order.get("average") or order.get("price") or price)
-        quantity   = float(order.get("filled") or order.get("amount") or quantity)
-        log.info("BUY OKX: %s id=%s qty=%.8f @ %.6f", symbol, order_id, quantity, exec_price)
-
-    return {
-        "symbol":      symbol,
-        "entry_price": exec_price,
-        "quantity":    quantity,
-        "invested":    round(quantity * exec_price, 4),
-        "peak_price":  exec_price,
-        "entry_time":  datetime.now(timezone.utc).isoformat(),
-        "order_id":    order_id,
-        "sl_pct":      -STOP_LOSS_PCT,   # SL inicial -1.5%
-        "max_pnl":     0.0,              # máximo P&L alcanzado
-        "tp_order_id": "",               # se rellena después del buy
-    }
-
-def _execute_sell(symbol: str, quantity: float) -> dict:
-    """
-    Venta MARKET — Zero-Dust: lee saldo real antes de vender.
-    Cancelar la TP limit order antes de llamar a esta función.
-    """
-    ex   = get_exchange()
-    coin = symbol.split("/")[0]
-
-    if DRY_RUN:
-        price    = _fetch_price(symbol)
-        order_id = f"DRY-SELL-{int(time.time())}"
-        log.info("[DRY RUN] SELL %s qty=%.8f @ %.6f", symbol, quantity, price)
-    else:
-        try:
-            bal      = ex.fetch_balance()
-            real_qty = float((bal.get(coin) or {}).get("free", 0.0) or 0.0)
-            if real_qty <= 0:
-                raise ValueError(f"Saldo real de {coin} es 0")
-            sell_qty = real_qty * 0.999
-            if abs(sell_qty - quantity) > 1e-6:
-                log.info("SELL %s zero-dust: mem=%.8f real=%.8f venta=%.8f",
-                         symbol, quantity, real_qty, sell_qty)
-        except Exception as e:
-            log.warning("No pude leer saldo real de %s: %s", coin, e)
-            sell_qty = quantity
-
-        order    = ex.create_market_sell_order(
-            symbol, sell_qty, params={"tdMode": "cash"}
-        )
-        order_id = str(order.get("id", ""))
-        exec_p   = order.get("average") or order.get("price")
-        price    = float(exec_p) if exec_p else _fetch_price(symbol)
-        quantity = sell_qty
-        log.info("SELL OKX: %s id=%s qty=%.8f @ %.6f", symbol, order_id, quantity, price)
-
-    return {
-        "price":    price,
-        "proceeds": round(price * quantity, 4),
-        "order_id": order_id,
-    }
+            log.error("daily_report_loop: %s", e)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # GESTIÓN DE CAPITAL Y RIESGO
@@ -660,23 +525,40 @@ def _execute_sell(symbol: str, quantity: float) -> dict:
 def _slots_available() -> int:
     return MAX_POSITIONS - len(state["positions"])
 
+def _in_cooldown(symbol: str) -> bool:
+    """
+    Cooldown de 30 min tras un Stop-Loss.
+    Evita reentrar inmediatamente en la misma trampa de precio.
+    """
+    ts = state.get("sl_cooldown", {}).get(symbol)
+    if not ts:
+        return False
+    remaining = SL_COOLDOWN_SEC - (time.time() - float(ts))
+    if remaining > 0:
+        log.info("COOLDOWN %s: %.0f s restantes", symbol, remaining)
+        return True
+    return False
+
+def _set_cooldown(symbol: str):
+    if "sl_cooldown" not in state:
+        state["sl_cooldown"] = {}
+    state["sl_cooldown"][symbol] = time.time()
+    save_state()
+
 def _reset_daily_if_needed(total: float):
     today = date.today().isoformat()
     if state.get("daily_date") == today:
         return
-    log.info("Nuevo día (%s → %s) — reseteando estadísticas",
-             state.get("daily_date", "ninguna"), today)
-    state["daily_date"]         = today
-    state["daily_start_bal"]    = total
-    state["daily_realized_pnl"] = 0.0
-    state["trades_today"]       = 0
-    state["wins_today"]         = 0
-    state["losses_today"]       = 0
+    log.info("Nuevo día (%s → %s) — reset", state.get("daily_date", "?"), today)
+    state.update({
+        "daily_date": today, "daily_start_bal": total,
+        "daily_realized_pnl": 0.0, "trades_today": 0,
+        "wins_today": 0, "losses_today": 0,
+    })
     if state.get("kill_switch") and "Drawdown" in state.get("kill_switch_reason", ""):
-        log.info("Kill switch de drawdown reseteado para el nuevo día.")
         state["kill_switch"]        = False
         state["kill_switch_reason"] = ""
-    log.info("Reset diario — saldo inicial: %.2f USDC", total)
+        log.info("Kill switch reseteado para el nuevo día.")
     save_state()
 
 def _check_kill_switch(total: float) -> tuple[bool, float]:
@@ -690,92 +572,175 @@ def _check_kill_switch(total: float) -> tuple[bool, float]:
         state["kill_switch"]        = True
         state["kill_switch_reason"] = f"Drawdown {dd:.2f}% > {KILL_SWITCH_PCT}%"
         save_state()
-        log.warning("KILL SWITCH: drawdown %.2f%%", dd)
+        log.warning("KILL SWITCH: %.2f%%", dd)
         return True, dd
     return False, dd
 
 def _escalate_trailing(pos: dict) -> tuple[float, Optional[int]]:
-    """
-    Calcula el nuevo SL según los escalones del trailing.
-    Devuelve (new_sl_pct, step_number_if_changed_else_None).
-    El SL solo sube, nunca baja.
-    """
+    """SL solo sube — aplica el escalón más alto alcanzado."""
     max_pnl  = pos.get("max_pnl", 0.0)
     cur_sl   = pos.get("sl_pct", -STOP_LOSS_PCT)
-    new_sl   = cur_sl
-    step_hit = None
-
-    for i, (trigger, floor) in enumerate(TRAIL_STEPS, start=1):
+    new_sl, step_hit = cur_sl, None
+    for i, (trigger, floor) in enumerate(TRAIL_STEPS, 1):
         if max_pnl >= trigger and floor > cur_sl:
-            new_sl   = floor
-            step_hit = i
-
+            new_sl, step_hit = floor, i
     return new_sl, step_hit
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ANÁLISIS — CUÁDRUPLE CONFIRMACIÓN
+# ANÁLISIS — 5 CONDICIONES SIMULTÁNEAS
 # ══════════════════════════════════════════════════════════════════════════════
 async def _analyze(symbol: str) -> Optional[dict]:
     """
-    1. EMA200 (1h): precio > EMA200 → macro tendencia alcista
-    2. RSI < 35 (5m)
-    3. MACD bullish (5m)
-    4. Volumen > avg×1.2 (5m)
-    Devuelve dict o None si datos insuficientes / señal no activa.
+    Señal de entrada de alta precisión — las 5 deben cumplirse:
+    1. EMA200(1h)  — macro tendencia alcista
+    2. RSI < 35    — sobreventa en 5m
+    3. RSI↑        — rebote confirmado (no caída libre) [NUEVO]
+    4. MACD cruce  — confirmado (h0>=0, no prematuro)   [OPTIMIZADO]
+    5. Vol ×1.2    — dinero real detrás del movimiento
+    + Vela alcista — price action confirma el momento   [NUEVO]
     """
     try:
-        # Obtener datos 1h para EMA200 y datos 5m para señales
         ohlcv_1h = await _async(_fetch_ohlcv, symbol, EMA200_TF, EMA200_LIMIT)
         ohlcv_5m = await _async(_fetch_ohlcv, symbol, TIMEFRAME, OHLCV_LIMIT)
 
         if len(ohlcv_5m) < max(35, VOLUME_LOOKBACK + 1):
             return None
 
-        closes_5m    = [float(c[4]) for c in ohlcv_5m]
-        current_price = closes_5m[-1]
+        closes_5m = [float(c[4]) for c in ohlcv_5m]
+        price     = closes_5m[-1]
 
-        # Filtro macro EMA200 — primera barrera
-        ema_ok  = _ema200_above(ohlcv_1h, current_price)
-        rsi     = _rsi(closes_5m)
-        bullish = _macd_bullish(closes_5m)
-        vol_ok  = _volume_filter(ohlcv_5m)
+        ema_ok    = _ema200_above(ohlcv_1h, price)
+        rsi_val   = _rsi(closes_5m)
+        rsi_up    = _rsi_ascending(closes_5m)          # RSI ascendente
+        macd_ok   = _macd_confirmed_crossover(closes_5m)  # cruce confirmado
+        vol_ok    = _volume_filter(ohlcv_5m)
+        candle_ok = _bullish_candle(ohlcv_5m)           # vela alcista
+
+        # Señal completa — las 6 condiciones
+        signal = (ema_ok and rsi_val < RSI_BUY and rsi_up
+                  and macd_ok and vol_ok and candle_ok)
 
         return {
-            "price":   current_price,
-            "rsi":     rsi,
-            "bullish": bullish,
-            "vol_ok":  vol_ok,
-            "ema_ok":  ema_ok,
-            # Señal solo si las 4 condiciones se cumplen
-            "signal":  ema_ok and rsi < RSI_BUY and bullish and vol_ok,
+            "price":     price,
+            "rsi":       rsi_val,
+            "rsi_up":    rsi_up,
+            "macd_ok":   macd_ok,
+            "vol_ok":    vol_ok,
+            "ema_ok":    ema_ok,
+            "candle_ok": candle_ok,
+            "signal":    signal,
         }
     except Exception as e:
         log.debug("Error analizando %s: %s", symbol, e)
         return None
 
 # ══════════════════════════════════════════════════════════════════════════════
+# ÓRDENES
+# ══════════════════════════════════════════════════════════════════════════════
+def _execute_buy(symbol: str, usdc_amount: float) -> dict:
+    ex     = get_exchange()
+    market = ex.markets.get(symbol, {})
+    price  = _fetch_price(symbol)
+    if price <= 0:
+        raise ValueError(f"Precio inválido: {symbol}")
+
+    lot_step = (
+        market.get("precision", {}).get("amount")
+        or (market.get("limits") or {}).get("amount", {}).get("min", 0.0001)
+        or 0.0001
+    )
+    quantity = _round_step(usdc_amount / price, lot_step)
+    min_qty  = ((market.get("limits") or {}).get("amount") or {}).get("min") or 0.0
+    if quantity < min_qty:
+        quantity = _round_step(min_qty * 1.05, lot_step)
+
+    if DRY_RUN:
+        oid, exec_price = f"DRY-BUY-{int(time.time())}", price
+        log.info("[DRY RUN] BUY %s qty=%.8f @ %.6f", symbol, quantity, price)
+    else:
+        try:
+            order = ex.createMarketBuyOrderWithCost(
+                symbol, usdc_amount, params={"tdMode": "cash"}
+            )
+        except (ccxt.NotSupported, AttributeError):
+            order = ex.create_market_buy_order(
+                symbol, quantity, params={"tdMode": "cash"}
+            )
+        oid        = str(order.get("id", ""))
+        exec_price = float(order.get("average") or order.get("price") or price)
+        quantity   = float(order.get("filled") or order.get("amount") or quantity)
+        log.info("BUY OKX: %s id=%s qty=%.8f @ %.6f", symbol, oid, quantity, exec_price)
+
+    return {
+        "symbol":      symbol,
+        "entry_price": exec_price,
+        "quantity":    quantity,
+        "invested":    round(quantity * exec_price, 4),
+        "peak_price":  exec_price,
+        "entry_time":  datetime.now(timezone.utc).isoformat(),
+        "order_id":    oid,
+        "sl_pct":      -STOP_LOSS_PCT,
+        "max_pnl":     0.0,
+        "tp_order_id": "",
+    }
+
+def _execute_sell(symbol: str, quantity: float) -> dict:
+    """Zero-Dust: usa saldo real del exchange."""
+    ex   = get_exchange()
+    coin = symbol.split("/")[0]
+
+    if DRY_RUN:
+        price = _fetch_price(symbol)
+        oid   = f"DRY-SELL-{int(time.time())}"
+        log.info("[DRY RUN] SELL %s qty=%.8f @ %.6f", symbol, quantity, price)
+    else:
+        try:
+            bal      = ex.fetch_balance()
+            real_qty = float((bal.get(coin) or {}).get("free", 0.0) or 0.0)
+            if real_qty <= 0:
+                raise ValueError(f"Saldo {coin} = 0")
+            sell_qty = real_qty * 0.999
+            if abs(sell_qty - quantity) > 1e-6:
+                log.info("Zero-dust %s: mem=%.8f real=%.8f venta=%.8f",
+                         symbol, quantity, real_qty, sell_qty)
+        except Exception as e:
+            log.warning("No pude leer saldo real de %s: %s", coin, e)
+            sell_qty = quantity
+
+        order = ex.create_market_sell_order(
+            symbol, sell_qty, params={"tdMode": "cash"}
+        )
+        oid   = str(order.get("id", ""))
+        ep    = order.get("average") or order.get("price")
+        price = float(ep) if ep else _fetch_price(symbol)
+        quantity = sell_qty
+        log.info("SELL OKX: %s id=%s qty=%.8f @ %.6f", symbol, oid, quantity, price)
+
+    return {"price": price, "proceeds": round(price * quantity, 4), "order_id": oid}
+
+# ══════════════════════════════════════════════════════════════════════════════
 # OPERACIONES CON NOTIFICACIÓN
 # ══════════════════════════════════════════════════════════════════════════════
 async def _buy(symbol: str, bot: Bot, reason: str) -> bool:
-    """Compra, coloca TP limit order en servidor y notifica."""
-    # Whitelist pre-check
     if symbol not in ALLOWED_SYMBOLS:
-        log.critical("CRITICAL: compra NO autorizada: %s — cancelada", symbol)
-        await _notify(bot, f"🚨 Intento de compra no autorizada: {symbol} — CANCELADA")
+        log.critical("CRITICAL: compra no autorizada — %s", symbol)
         return False
 
     if symbol in state["positions"] or _slots_available() <= 0:
         return False
 
+    if _in_cooldown(symbol):
+        return False
+
     try:
         free = await _async(_fetch_usdc_free)
     except Exception as e:
-        log.error("Error obteniendo USDC libre: %s", e)
+        log.error("Error USDC libre: %s", e)
         return False
 
     amount = min(TRADE_USDC, free * 0.98)
     if amount < MIN_TRADE_USDC:
-        log.warning("USDC insuficiente para %s (%.2f disponible)", symbol, free)
+        log.warning("USDC insuficiente: %.2f", free)
         return False
 
     try:
@@ -785,18 +750,15 @@ async def _buy(symbol: str, bot: Bot, reason: str) -> bool:
         await _msg_error_grave(bot, f"No pude comprar {_coin_label(symbol)}: {e}")
         return False
 
-    # Whitelist post-check
     if symbol not in ALLOWED_SYMBOLS:
-        log.critical("CRITICAL: Buying unauthorized asset! %s — venta inmediata", symbol)
+        log.critical("CRITICAL: activo no autorizado post-buy — %s", symbol)
         await _async(_execute_sell, symbol, result["quantity"])
         return False
 
-    # Colocar TP limit order en el servidor OKX (0ms delay, fee maker)
-    tp_order_id = await _async(
-        _place_tp_limit_order,
-        symbol, result["quantity"], result["entry_price"]
+    tp_oid = await _async(
+        _place_tp_limit_order, symbol, result["quantity"], result["entry_price"]
     )
-    result["tp_order_id"] = tp_order_id
+    result["tp_order_id"] = tp_oid
 
     state["positions"][symbol] = result
     state["trades_today"]      = state.get("trades_today", 0) + 1
@@ -810,22 +772,14 @@ async def _buy(symbol: str, bot: Bot, reason: str) -> bool:
     tp_price = result["entry_price"] * (1 + TAKE_PROFIT_PCT / 100.0)
     await _msg_compra(bot, symbol, result["invested"], result["entry_price"],
                       total_bal, reason, tp_price)
-    log.info("COMPRA: %s %.2f USDC @ %.6f | TP order: %s",
-             symbol, result["invested"], result["entry_price"], tp_order_id)
+    log.info("COMPRA: %s %.2f USDC @ %.6f | TP=%s",
+             symbol, result["invested"], result["entry_price"], tp_oid)
     return True
 
-async def _sell(symbol: str, pos: dict, bot: Bot, motivo: str):
-    """
-    Cancela la TP limit order del servidor, luego vende a mercado.
-    Actualiza P&L y envía notificación.
-    """
-    # Cancelar la TP limit order antes de vender a mercado
+async def _sell(symbol: str, pos: dict, bot: Bot, motivo: str, is_sl: bool = False):
     tp_oid = pos.get("tp_order_id", "")
     if tp_oid:
-        cancelled = await _async(_cancel_order, symbol, tp_oid)
-        if not cancelled:
-            log.warning("No pude cancelar TP order %s — posible doble venta en %s",
-                        tp_oid, symbol)
+        await _async(_cancel_order, symbol, tp_oid)
 
     try:
         result = await _async(_execute_sell, symbol, pos["quantity"])
@@ -834,10 +788,7 @@ async def _sell(symbol: str, pos: dict, bot: Bot, motivo: str):
         await _msg_error_grave(bot, f"No pude vender {_coin_label(symbol)}: {e}")
         return
 
-    invested = pos["invested"]
-    proceeds = result["proceeds"]
-    pnl      = proceeds - invested
-
+    pnl = result["proceeds"] - pos["invested"]
     state["positions"].pop(symbol, None)
     state["daily_realized_pnl"] = round(
         state.get("daily_realized_pnl", 0.0) + pnl, 4
@@ -846,6 +797,11 @@ async def _sell(symbol: str, pos: dict, bot: Bot, motivo: str):
         state["wins_today"]   = state.get("wins_today", 0) + 1
     else:
         state["losses_today"] = state.get("losses_today", 0) + 1
+
+    # Activar cooldown si fue un stop-loss
+    if is_sl:
+        _set_cooldown(symbol)
+
     save_state()
 
     try:
@@ -860,20 +816,17 @@ async def _sell(symbol: str, pos: dict, bot: Bot, motivo: str):
     log.info("VENTA: %s P&L %+.2f USDC (%s)", symbol, pnl, motivo)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# BUCLE DE TRADING — cada 60 segundos
+# BUCLE DE TRADING — cada 5 minutos
 # ══════════════════════════════════════════════════════════════════════════════
 async def trading_loop(bot: Bot):
-    """
-    Cuádruple confirmación: EMA200(1h) + RSI(5m) + MACD(5m) + Vol(5m).
-    """
     now = datetime.now(timezone.utc)
-    log.info("━━━ CICLO %s ━━━", now.strftime("%d/%m %H:%M:%S"))
+    log.info("━━━ CICLO %s ━━━", now.strftime("%d/%m %H:%M"))
     state["last_scan"] = now.isoformat()
 
     try:
         total = await _async(_fetch_total_portfolio_usdc)
     except Exception as e:
-        log.error("Error obteniendo portfolio: %s", e)
+        log.error("Error portfolio: %s", e)
         return
 
     _reset_daily_if_needed(total)
@@ -881,12 +834,11 @@ async def trading_loop(bot: Bot):
     killed, dd = _check_kill_switch(total)
     if killed:
         if dd > 0:
-            log.warning("Kill switch: pérdida diaria %.2f%% (límite %.1f%%)",
-                        dd, KILL_SWITCH_PCT)
+            log.warning("Kill switch: drawdown %.2f%%", dd)
             await _msg_kill_switch(bot, total, dd)
         else:
-            log.warning("Kill switch activo: %s — ciclo omitido.",
-                        state.get("kill_switch_reason", "razón desconocida"))
+            log.warning("Kill switch activo: %s",
+                        state.get("kill_switch_reason", "?"))
         return
 
     if _slots_available() <= 0:
@@ -899,20 +851,20 @@ async def trading_loop(bot: Bot):
         btc_ok  = btc_chg > -BTC_DROP_BLOCK
         log.info("BTC 1h: %+.2f%% — %s", btc_chg, "OK" if btc_ok else "BLOQUEADO")
     except Exception as e:
-        log.warning("Error filtro BTC: %s", e)
+        log.warning("Error BTC guard: %s", e)
         btc_ok = True
 
     if not btc_ok:
-        log.info("BTC Guard: compras pausadas (%.2f%%)", btc_chg)
+        log.info("BTC Guard activo (%.2f%%)", btc_chg)
         return
 
-    # Escaneo
+    # Escaneo con cuádruple confirmación
     for symbol in ALLOWED_SYMBOLS:
-        if symbol not in ALLOWED_SYMBOLS:
-            continue
         if _slots_available() <= 0:
             break
         if symbol in state["positions"]:
+            continue
+        if _in_cooldown(symbol):
             continue
 
         a = await _analyze(symbol)
@@ -921,41 +873,36 @@ async def trading_loop(bot: Bot):
         if not a:
             continue
 
-        log.info("%s EMA=%s RSI=%.1f MACD=%s VOL=%s → %s",
+        log.info("%s EMA=%s RSI=%.1f(↑%s) MACD=%s VOL=%s VELA=%s → %s",
                  symbol,
-                 "OK" if a["ema_ok"] else "BAJO",
+                 "✓" if a["ema_ok"]    else "✗",
                  a["rsi"],
-                 "SI" if a["bullish"] else "NO",
-                 "SI" if a["vol_ok"] else "NO",
-                 "✅ SEÑAL" if a["signal"] else "❌")
+                 "✓" if a["rsi_up"]    else "✗",
+                 "✓" if a["macd_ok"]   else "✗",
+                 "✓" if a["vol_ok"]    else "✗",
+                 "✓" if a["candle_ok"] else "✗",
+                 "✅" if a["signal"]    else "❌")
 
         if a["signal"]:
-            reason = (
-                f"EMA200(1h)✅ RSI {a['rsi']:.1f} MACD✅ Vol✅"
-            )
+            reason = (f"EMA200✓ RSI{a['rsi']:.0f}↑ MACD-X✓ Vol✓ Vela✓")
             await _buy(symbol, bot, reason)
             await asyncio.sleep(1.0)
 
-    log.info("━━━ FIN CICLO — %d/%d posiciones ━━━",
+    log.info("━━━ FIN — %d/%d posiciones ━━━",
              len(state["positions"]), MAX_POSITIONS)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# BUCLE DE RIESGO — cada 10 segundos
+# BUCLE DE RIESGO — cada 15 segundos
 # ══════════════════════════════════════════════════════════════════════════════
 async def risk_loop(bot: Bot):
-    """
-    Usa fetch_tickers() batch para obtener todos los precios en 1 llamada.
-    Aplica trailing escalado y gestiona la TP limit order del servidor.
-    """
     if not state["positions"]:
         return
 
     symbols = list(state["positions"].keys())
-
     try:
         prices = await _async(_fetch_tickers_batch, symbols)
     except Exception as e:
-        log.warning("risk_loop: error obteniendo precios batch: %s", e)
+        log.warning("risk_loop batch error: %s", e)
         return
 
     for symbol, pos in list(state["positions"].items()):
@@ -967,18 +914,17 @@ async def risk_loop(bot: Bot):
             entry   = pos["entry_price"]
             pnl_pct = (price - entry) / entry * 100.0
 
-            # Actualizar peak_price y max_pnl
             if price > pos.get("peak_price", entry):
                 state["positions"][symbol]["peak_price"] = price
             max_pnl = max(pos.get("max_pnl", 0.0), pnl_pct)
             state["positions"][symbol]["max_pnl"] = max_pnl
 
-            # Escalado del trailing stop
+            # Escalado trailing
             new_sl, step_hit = _escalate_trailing({**pos, "max_pnl": max_pnl})
             if step_hit is not None:
                 state["positions"][symbol]["sl_pct"] = new_sl
                 save_state()
-                log.info("TRAILING Step %d: %s max_pnl=+%.2f%% → SL=+%.1f%%",
+                log.info("TRAILING Step %d: %s pico=+%.2f%% → SL=+%.1f%%",
                          step_hit, symbol, max_pnl, new_sl)
                 await _msg_sl_step(bot, symbol, step_hit, new_sl, max_pnl)
 
@@ -986,24 +932,25 @@ async def risk_loop(bot: Bot):
 
             # Stop-Loss
             if pnl_pct <= sl_pct:
+                is_sl = sl_pct < 0   # solo el SL inicial activa cooldown
                 if sl_pct >= 0:
-                    motivo = (f"Trailing Step (pico +{max_pnl:.2f}% → "
-                              f"SL {sl_pct:+.1f}%, ahora {pnl_pct:+.2f}%)")
+                    motivo = (f"Trailing Step SL={sl_pct:+.1f}% "
+                              f"(pico +{max_pnl:.2f}%, ahora {pnl_pct:+.2f}%)")
                 else:
                     motivo = f"Stop-Loss -{STOP_LOSS_PCT}% ({pnl_pct:+.2f}%)"
                 log.warning("SL: %s pnl=%.2f%% sl=%.2f%%", symbol, pnl_pct, sl_pct)
-                await _sell(symbol, pos, bot, motivo)
+                await _sell(symbol, pos, bot, motivo, is_sl=is_sl)
                 continue
 
-            # TP comprobación extra (por si la limit order fue cancelada o no se colocó)
+            # TP fallback (si la limit order no se colocó o fue cancelada)
             if pnl_pct >= TAKE_PROFIT_PCT and not pos.get("tp_order_id"):
-                motivo = f"Take-Profit +{TAKE_PROFIT_PCT}% ({pnl_pct:+.2f}%)"
-                log.info("TP fallback: %s +%.2f%%", symbol, pnl_pct)
-                await _sell(symbol, pos, bot, motivo)
+                motivo = f"TP fallback +{pnl_pct:.2f}%"
+                log.info("TP fallback: %s", symbol)
+                await _sell(symbol, pos, bot, motivo, is_sl=False)
                 continue
 
         except Exception as e:
-            log.error("Error risk_loop %s: %s", symbol, e)
+            log.error("risk_loop %s: %s", symbol, e)
 
     save_state()
 
@@ -1017,24 +964,22 @@ async def _run_trading_loop(bot: Bot):
         try:
             await trading_loop(bot)
         except (ccxt.NetworkError, ccxt.RequestTimeout) as e:
-            log.warning("Trading loop — red transitoria: %s. Siguiente ciclo.",
-                        type(e).__name__)
+            log.warning("Trading loop — red: %s. Siguiente ciclo.", type(e).__name__)
         except Exception as e:
-            log.error("Error crítico en trading_loop: %s", e)
+            log.error("Error trading_loop: %s", e)
             await _msg_error_grave(bot, str(e))
         await asyncio.sleep(TRADE_LOOP_SEC)
 
 async def _run_risk_loop(bot: Bot):
     await asyncio.sleep(30)
-    log.info("Risk loop activo — cada %ds (batch tickers)", RISK_LOOP_SEC)
+    log.info("Risk loop activo — cada %ds (batch)", RISK_LOOP_SEC)
     while True:
         try:
             await risk_loop(bot)
         except (ccxt.NetworkError, ccxt.RequestTimeout) as e:
-            log.warning("Risk loop — red transitoria: %s. Siguiente tick.",
-                        type(e).__name__)
+            log.warning("Risk loop — red: %s. Siguiente tick.", type(e).__name__)
         except Exception as e:
-            log.error("Error crítico en risk_loop: %s", e)
+            log.error("Error risk_loop: %s", e)
         await asyncio.sleep(RISK_LOOP_SEC)
 
 async def _run_daily_report_loop(bot: Bot):
@@ -1048,7 +993,7 @@ async def main():
     if not TELEGRAM_TOKEN:
         raise RuntimeError("TELEGRAM_TOKEN no configurado")
 
-    log.info("════ ELITE HFT SCALPER V4 — OKX EEA ════")
+    log.info("════ ELITE SCALPER V5 MAX ALPHA — OKX EEA ════")
     log.info("Persistencia: %s", os.path.abspath(POSITIONS_FILE))
 
     bot = Bot(token=TELEGRAM_TOKEN)
@@ -1056,41 +1001,36 @@ async def main():
 
     try:
         ex = get_exchange()
-
         log.info("[1/3] Cargando mercados OKX (eea.okx.com)...")
         await _async(ex.load_markets)
         log.info("✅ [1/3] %d mercados", len(ex.markets))
 
-        log.info("[2/3] Auth y saldo...")
+        log.info("[2/3] Auth y saldo USDC...")
         total_bal = await _async(_fetch_total_portfolio_usdc)
         free_usdc = await _async(_fetch_usdc_free)
-        log.info("✅ [2/3] Auth OK — libre: %.2f / total: %.2f", free_usdc, total_bal)
+        log.info("✅ [2/3] OK — libre: %.2f / total: %.2f", free_usdc, total_bal)
         connected = True
 
-        log.info("[3/3] Verificando ALLOWED_SYMBOLS...")
+        log.info("[3/3] ALLOWED_SYMBOLS en OKX...")
         for sym in ALLOWED_SYMBOLS:
             if sym in ex.markets:
                 log.info("  ✅ %s", sym)
             else:
-                log.warning("  ⚠️ %s NO disponible en OKX", sym)
-
+                log.warning("  ⚠️ %s NO disponible", sym)
         btc_chg = await _async(_fetch_btc_1h_change)
         log.info("✅ [3/3] BTC 1h: %+.2f%%", btc_chg)
 
     except ccxt.AuthenticationError as e:
-        log.error("❌ Auth OKX fallida: %s", e)
-        await bot.send_message(
-            chat_id=CHAT_ID,
-            text="❌ Error de autenticación OKX.\n\n"
-                 "Comprueba OKX_API_KEY, OKX_SECRET_KEY y OKX_PASSPHRASE en Railway."
-        )
+        log.error("❌ Auth OKX: %s", e)
+        await bot.send_message(chat_id=CHAT_ID,
+            text="❌ Auth OKX fallida. Revisa OKX_API_KEY, SECRET y PASSPHRASE.")
         return
 
     except (ccxt.NetworkError, ccxt.RequestTimeout) as e:
-        log.error("❌ Error de red al arrancar: %s — continuando", e)
+        log.error("❌ Red OKX: %s — continuando", e)
 
     except Exception as e:
-        log.error("❌ Error inesperado al arrancar: %s", e)
+        log.error("❌ Error arranque: %s", e)
 
     load_state()
 
@@ -1102,12 +1042,9 @@ async def main():
         await _send_status_report(bot)
     else:
         await _notify(bot,
-            "He arrancado pero tengo problemas de conexión con OKX.\n"
-            "Lo reintentaré automáticamente."
-        )
+            "Arrancado con problemas de red — reintentando automáticamente.")
 
     log.info("════ BOT LISTO — %s ════", "DRY RUN" if DRY_RUN else "MODO REAL")
-
     while True:
         await asyncio.sleep(3600)
 
