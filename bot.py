@@ -88,7 +88,7 @@ TIMEFRAME        = "5m"
 OHLCV_LIMIT      = 80     # 80 velas × 5m = ~6.5h de historia (más contexto MACD)
 EMA200_TF        = "1h"
 EMA200_LIMIT     = 210
-RSI_BUY          = 35
+RSI_BUY          = 38    # subido de 35 → más oportunidades sin perder calidad
 VOLUME_MULT      = 1.2
 VOLUME_LOOKBACK  = 10
 BTC_DROP_BLOCK   = 1.0    # pausa si BTC cae > 1% en 1h
@@ -229,19 +229,25 @@ def _macd_histogram_series(closes: list) -> list:
 
 def _macd_confirmed_crossover(closes: list) -> bool:
     """
-    SOLO cruce alcista CONFIRMADO: h[-1] >= 0 Y h[-2] < 0.
-    
-    SUPRESIÓN ESTRATÉGICA: eliminamos la condición "turning" (histograma
-    negativo pero creciendo) que estaba en versiones anteriores.
-    Esa condición generaba entradas prematuras antes de que el cruce
-    se materializara, resultando en compras en medio de caídas.
-    Ahora solo entramos cuando el MACD ha cruzado al alza de forma confirmada.
+    Cruce alcista CONFIRMADO con ventana de 3 velas.
+
+    El cruce exacto (h[-2]<0, h[-1]>=0) se detecta en un solo candle de 5m.
+    Con un scan cada 5 minutos, el bot puede llegar 1-2 velas tarde si el
+    ciclo no coincide exactamente con el momento del cruce.
+    Ampliamos la ventana a 3 velas: si el cruce ocurrió en cualquiera de
+    las últimas 3 velas (15 minutos), la señal sigue siendo válida.
+    Esto triplica las oportunidades de capturar el cruce sin perder precisión
+    (el histograma sigue debiendo haber cruzado de negativo a positivo).
     """
     hist = _macd_histogram_series(closes)
-    if len(hist) < 2:
+    if len(hist) < 3:
         return False
-    h0, h1 = hist[-1], hist[-2]
-    return h1 < 0.0 and h0 >= 0.0   # cruce real: negativo → positivo
+    h0, h1, h2 = hist[-1], hist[-2], hist[-3]
+    # Cruce en las últimas 2 velas (estándar)
+    cross_v1 = h1 < 0.0 and h0 >= 0.0
+    # Cruce en las últimas 3 velas (ventana ampliada)
+    cross_v2 = h2 < 0.0 and h1 >= 0.0 and h0 >= 0.0
+    return cross_v1 or cross_v2
 
 def _rsi_ascending(closes: list, period: int = 14) -> bool:
     """
@@ -611,14 +617,27 @@ async def _analyze(symbol: str) -> Optional[dict]:
 
         ema_ok    = _ema200_above(ohlcv_1h, price)
         rsi_val   = _rsi(closes_5m)
-        rsi_up    = _rsi_ascending(closes_5m)          # RSI ascendente
-        macd_ok   = _macd_confirmed_crossover(closes_5m)  # cruce confirmado
+        rsi_up    = _rsi_ascending(closes_5m)
+        macd_ok   = _macd_confirmed_crossover(closes_5m)
         vol_ok    = _volume_filter(ohlcv_5m)
-        candle_ok = _bullish_candle(ohlcv_5m)           # vela alcista
+        candle_ok = _bullish_candle(ohlcv_5m)
 
-        # Señal completa — las 6 condiciones
         signal = (ema_ok and rsi_val < RSI_BUY and rsi_up
                   and macd_ok and vol_ok and candle_ok)
+
+        # Log detallado a INFO (visible en Railway) para diagnóstico de señales
+        log.info(
+            "%s | EMA=%s RSI=%.1f(<38=%s,↑=%s) MACD=%s VOL=%s VELA=%s → %s",
+            symbol,
+            "✓" if ema_ok    else "✗",
+            rsi_val,
+            "✓" if rsi_val < RSI_BUY else "✗",
+            "✓" if rsi_up    else "✗",
+            "✓" if macd_ok   else "✗",
+            "✓" if vol_ok    else "✗",
+            "✓" if candle_ok else "✗",
+            "✅ SEÑAL" if signal else "❌ sin señal",
+        )
 
         return {
             "price":     price,
@@ -872,16 +891,6 @@ async def trading_loop(bot: Bot):
 
         if not a:
             continue
-
-        log.info("%s EMA=%s RSI=%.1f(↑%s) MACD=%s VOL=%s VELA=%s → %s",
-                 symbol,
-                 "✓" if a["ema_ok"]    else "✗",
-                 a["rsi"],
-                 "✓" if a["rsi_up"]    else "✗",
-                 "✓" if a["macd_ok"]   else "✗",
-                 "✓" if a["vol_ok"]    else "✗",
-                 "✓" if a["candle_ok"] else "✗",
-                 "✅" if a["signal"]    else "❌")
 
         if a["signal"]:
             reason = (f"EMA200✓ RSI{a['rsi']:.0f}↑ MACD-X✓ Vol✓ Vela✓")
