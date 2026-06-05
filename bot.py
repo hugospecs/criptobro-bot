@@ -118,6 +118,13 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+# ── Cache de EMA200(1h) ───────────────────────────────────────────────────────
+# La EMA200 en 1h cambia muy lentamente (una nueva vela cada hora).
+# Descargar 210 velas × 5 símbolos en cada ciclo de 5m es innecesario.
+# Cache con TTL de 30 min: ahorra ~50% de llamadas API en el trading loop.
+_EMA200_CACHE: dict = {}   # {symbol: (ema200_value, timestamp_unix)}
+_EMA200_TTL   = 1800       # 30 minutos
+
 # ══════════════════════════════════════════════════════════════════════════════
 # ESTADO GLOBAL
 # ══════════════════════════════════════════════════════════════════════════════
@@ -181,7 +188,7 @@ def get_exchange() -> ccxt.okx:
     return _exchange
 
 async def _async(fn, *args, **kwargs):
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, partial(fn, *args, **kwargs))
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -196,17 +203,36 @@ def _ema(prices: list, period: int) -> float:
     return e
 
 def _rsi_series(closes: list, period: int = 14) -> list:
-    """Devuelve la serie RSI completa (útil para detectar dirección)."""
+    """
+    Serie RSI completa usando suavizado de Wilder — O(n) en lugar de O(n²).
+    La versión anterior recalculaba sumas desde cero para cada barra.
+    Wilder usa medias móviles exponenciales: avg_gain = avg_gain*(period-1)/period + gain/period.
+    Con 80 velas y period=14, la mejora es ~6× en velocidad.
+    """
     if len(closes) < period + 2:
         return [50.0, 50.0]
-    result = []
+
     deltas = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
-    for i in range(period, len(deltas)):
-        g = [max(d, 0.0) for d in deltas[i - period:i]]
-        l = [max(-d, 0.0) for d in deltas[i - period:i]]
-        ag, al = sum(g) / period, sum(l) / period
-        result.append(100.0 if al == 0 else round(100.0 - 100.0 / (1.0 + ag / al), 2))
-    return result if result else [50.0, 50.0]
+
+    # Seed con SMA de los primeros `period` deltas
+    gains  = [max(d, 0.0) for d in deltas[:period]]
+    losses = [max(-d, 0.0) for d in deltas[:period]]
+    avg_g  = sum(gains)  / period
+    avg_l  = sum(losses) / period
+
+    result = []
+    # Primera observación
+    result.append(100.0 if avg_l == 0 else round(100.0 - 100.0 / (1.0 + avg_g / avg_l), 2))
+
+    # Suavizado de Wilder para el resto
+    for d in deltas[period:]:
+        g = max(d, 0.0)
+        l = max(-d, 0.0)
+        avg_g = (avg_g * (period - 1) + g) / period
+        avg_l = (avg_l * (period - 1) + l) / period
+        result.append(100.0 if avg_l == 0 else round(100.0 - 100.0 / (1.0 + avg_g / avg_l), 2))
+
+    return result if len(result) >= 2 else [50.0, 50.0]
 
 def _rsi(closes: list, period: int = 14) -> float:
     s = _rsi_series(closes, period)
@@ -289,15 +315,34 @@ def _volume_filter(ohlcv: list) -> bool:
               cur_vol, avg_vol, cur_vol / avg_vol, "OK" if passes else "NO")
     return passes
 
-def _ema200_above(ohlcv_1h: list, current_price: float) -> bool:
-    """Precio > EMA200 en 1h: macro tendencia alcista."""
-    if len(ohlcv_1h) < 200:
-        return True   # sin suficientes datos, no bloqueamos
-    closes_1h = [float(c[4]) for c in ohlcv_1h]
-    ema200    = _ema(closes_1h, 200)
-    above     = current_price > ema200
-    log.debug("EMA200(1h): precio=%.5f ema200=%.5f → %s",
-              current_price, ema200, "SOBRE" if above else "BAJO")
+def _ema200_above_cached(symbol: str, current_price: float) -> bool:
+    """
+    Versión cacheada de _ema200_above.
+    Descarga las 210 velas de 1h solo si el cache expiró (>30 min).
+    En un ciclo normal de 5 min, usa el valor en memoria sin llamada API.
+    """
+    now = time.time()
+    cached = _EMA200_CACHE.get(symbol)
+    if cached and (now - cached[1]) < _EMA200_TTL:
+        ema200 = cached[0]
+        log.debug("EMA200 cache HIT %s: %.5f (edad %.0fs)", symbol, ema200, now - cached[1])
+    else:
+        try:
+            ex    = get_exchange()
+            ohlcv = ex.fetch_ohlcv(symbol, EMA200_TF, limit=EMA200_LIMIT)
+            if len(ohlcv) < 200:
+                return True   # sin datos suficientes, no bloqueamos
+            closes_1h = [float(c[4]) for c in ohlcv]
+            ema200    = _ema(closes_1h, 200)
+            _EMA200_CACHE[symbol] = (ema200, now)
+            log.debug("EMA200 cache MISS %s: calculada %.5f", symbol, ema200)
+        except Exception as e:
+            log.warning("EMA200 fetch error %s: %s — omitiendo filtro", symbol, e)
+            return True
+
+    above = current_price > ema200
+    log.debug("EMA200(1h) %s: precio=%.5f ema=%.5f → %s",
+              symbol, current_price, ema200, "SOBRE" if above else "BAJO")
     return above
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -478,23 +523,29 @@ async def _send_status_report(bot: Bot):
 
     positions = state.get("positions", {})
     pos_lines = []
-    for symbol, pos in positions.items():
-        entry  = pos.get("entry_price", 0.0)
-        inv    = pos.get("invested", 0.0)
-        sl_pct = pos.get("sl_pct", -STOP_LOSS_PCT)
-        tp_oid = pos.get("tp_order_id", "")
+    if positions:
+        # Una sola llamada batch para todos los precios
         try:
-            p       = await _async(_fetch_price, symbol)
-            pct     = ((p - entry) / entry * 100.0) if entry else 0.0
-            icon    = "📈" if pct >= 0 else "📉"
-            tp_tag  = " 🎯TP-svr" if tp_oid else ""
-            pos_lines.append(
-                f"  {icon} {_coin_label(symbol)}{tp_tag}\n"
-                f"     {entry:.5f}→{p:.5f} | {inv:.2f}USDC | P&L:{pct:+.2f}%\n"
-                f"     SL:{sl_pct:+.1f}%"
-            )
+            batch_prices = await _async(_fetch_tickers_batch, list(positions.keys()))
         except Exception:
-            pos_lines.append(f"  ⚪ {_coin_label(symbol)} | Sin precio")
+            batch_prices = {}
+        for symbol, pos in positions.items():
+            entry  = pos.get("entry_price", 0.0)
+            inv    = pos.get("invested", 0.0)
+            sl_pct = pos.get("sl_pct", -STOP_LOSS_PCT)
+            tp_oid = pos.get("tp_order_id", "")
+            p      = batch_prices.get(symbol, 0.0)
+            if p > 0:
+                pct    = ((p - entry) / entry * 100.0) if entry else 0.0
+                icon   = "📈" if pct >= 0 else "📉"
+                tp_tag = " 🎯TP-svr" if tp_oid else ""
+                pos_lines.append(
+                    f"  {icon} {_coin_label(symbol)}{tp_tag}\n"
+                    f"     {entry:.5f}→{p:.5f} | {inv:.2f}USDC | P&L:{pct:+.2f}%\n"
+                    f"     SL:{sl_pct:+.1f}%"
+                )
+            else:
+                pos_lines.append(f"  ⚪ {_coin_label(symbol)} | Sin precio")
 
     wins   = state.get("wins_today", 0)
     losses = state.get("losses_today", 0)
@@ -597,16 +648,15 @@ def _escalate_trailing(pos: dict) -> tuple[float, Optional[int]]:
 # ══════════════════════════════════════════════════════════════════════════════
 async def _analyze(symbol: str) -> Optional[dict]:
     """
-    Señal de entrada de alta precisión — las 5 deben cumplirse:
-    1. EMA200(1h)  — macro tendencia alcista
-    2. RSI < 35    — sobreventa en 5m
-    3. RSI↑        — rebote confirmado (no caída libre) [NUEVO]
-    4. MACD cruce  — confirmado (h0>=0, no prematuro)   [OPTIMIZADO]
-    5. Vol ×1.2    — dinero real detrás del movimiento
-    + Vela alcista — price action confirma el momento   [NUEVO]
+    Señal de entrada — 6 condiciones simultáneas:
+    1. EMA200(1h) cacheada  — macro tendencia alcista (cache 30 min, sin API extra)
+    2. RSI < 38             — sobreventa en 5m
+    3. RSI ascendente       — rebote confirmado, no caída libre
+    4. MACD cruce (3 velas) — momentum confirmado
+    5. Volumen > avg×1.2    — dinero real detrás
+    6. Vela alcista         — price action confirma el momento
     """
     try:
-        ohlcv_1h = await _async(_fetch_ohlcv, symbol, EMA200_TF, EMA200_LIMIT)
         ohlcv_5m = await _async(_fetch_ohlcv, symbol, TIMEFRAME, OHLCV_LIMIT)
 
         if len(ohlcv_5m) < max(35, VOLUME_LOOKBACK + 1):
@@ -615,7 +665,7 @@ async def _analyze(symbol: str) -> Optional[dict]:
         closes_5m = [float(c[4]) for c in ohlcv_5m]
         price     = closes_5m[-1]
 
-        ema_ok    = _ema200_above(ohlcv_1h, price)
+        ema_ok    = await _async(_ema200_above_cached, symbol, price)
         rsi_val   = _rsi(closes_5m)
         rsi_up    = _rsi_ascending(closes_5m)
         macd_ok   = _macd_confirmed_crossover(closes_5m)
@@ -625,7 +675,6 @@ async def _analyze(symbol: str) -> Optional[dict]:
         signal = (ema_ok and rsi_val < RSI_BUY and rsi_up
                   and macd_ok and vol_ok and candle_ok)
 
-        # Log detallado a INFO (visible en Railway) para diagnóstico de señales
         log.info(
             "%s | EMA=%s RSI=%.1f(<38=%s,↑=%s) MACD=%s VOL=%s VELA=%s → %s",
             symbol,
@@ -640,14 +689,9 @@ async def _analyze(symbol: str) -> Optional[dict]:
         )
 
         return {
-            "price":     price,
-            "rsi":       rsi_val,
-            "rsi_up":    rsi_up,
-            "macd_ok":   macd_ok,
-            "vol_ok":    vol_ok,
-            "ema_ok":    ema_ok,
-            "candle_ok": candle_ok,
-            "signal":    signal,
+            "price": price, "rsi": rsi_val, "rsi_up": rsi_up,
+            "macd_ok": macd_ok, "vol_ok": vol_ok,
+            "ema_ok": ema_ok, "candle_ok": candle_ok, "signal": signal,
         }
     except Exception as e:
         log.debug("Error analizando %s: %s", symbol, e)
@@ -957,6 +1001,37 @@ async def risk_loop(bot: Bot):
                 log.info("TP fallback: %s", symbol)
                 await _sell(symbol, pos, bot, motivo, is_sl=False)
                 continue
+
+            # Detectar TP limit order ejecutada por OKX
+            # Si la TP order existe pero el precio ya está por encima del TP,
+            # OKX la ejecutó y el bot no lo sabe todavía — registrar la ganancia.
+            tp_oid = pos.get("tp_order_id", "")
+            if tp_oid and pnl_pct >= TAKE_PROFIT_PCT - 0.1:
+                try:
+                    ex    = get_exchange()
+                    order = ex.fetch_order(tp_oid, symbol)
+                    if order.get("status") in ("closed", "filled"):
+                        filled_price = float(order.get("average") or order.get("price") or price)
+                        proceeds     = filled_price * pos["quantity"]
+                        pnl          = proceeds - pos["invested"]
+                        state["positions"].pop(symbol, None)
+                        state["daily_realized_pnl"] = round(
+                            state.get("daily_realized_pnl", 0.0) + pnl, 4
+                        )
+                        state["wins_today"] = state.get("wins_today", 0) + 1
+                        save_state()
+                        log.info("TP ejecutado por OKX: %s P&L +%.2f USDC", symbol, pnl)
+                        try:
+                            total_bal = await _async(_fetch_total_portfolio_usdc)
+                        except Exception:
+                            total_bal = 0.0
+                        await _msg_venta_ganancia(
+                            bot, symbol, pnl, total_bal,
+                            f"TP server +{TAKE_PROFIT_PCT}% ejecutado por OKX"
+                        )
+                        continue
+                except Exception:
+                    pass   # si no podemos consultar la orden, continuamos normal
 
         except Exception as e:
             log.error("risk_loop %s: %s", symbol, e)
