@@ -86,8 +86,9 @@ KILL_SWITCH_PCT = 5.0
 # ── Estrategia ────────────────────────────────────────────────────────────────
 TIMEFRAME        = "5m"
 OHLCV_LIMIT      = 80     # 80 velas × 5m = ~6.5h de historia (más contexto MACD)
-EMA200_TF        = "1h"
-EMA200_LIMIT     = 210
+EMA_TF           = "1h"
+EMA_PERIOD       = 50     # EMA50 en lugar de EMA200 — reacciona en ~50h, no ~200h
+EMA_LIMIT        = 70     # 70 velas de 1h son suficientes para EMA50 con contexto
 RSI_BUY          = 38    # subido de 35 → más oportunidades sin perder calidad
 VOLUME_MULT      = 1.2
 VOLUME_LOOKBACK  = 10
@@ -96,11 +97,12 @@ SL_COOLDOWN_SEC  = 1800   # 30 min de cooldown por símbolo tras un SL
 
 # ── Whitelist estricta ────────────────────────────────────────────────────────
 ALLOWED_SYMBOLS = [
-    "NEAR/USDC",
+    "SOL/USDC",
     "FET/USDC",
     "RENDER/USDC",
+    "NEAR/USDC",
     "LINK/USDC",
-    "SOL/USDC",
+    "BTC/USDC",    # rebotes de mayor calidad, menor correlación con altcoins
 ]
 WATCHLIST = ALLOWED_SYMBOLS
 
@@ -110,6 +112,7 @@ COIN_NAMES = {
     "RENDER/USDC": "Render",
     "NEAR/USDC":   "NEAR Protocol",
     "LINK/USDC":   "Chainlink",
+    "BTC/USDC":    "Bitcoin",
 }
 
 logging.basicConfig(
@@ -122,8 +125,10 @@ log = logging.getLogger(__name__)
 # La EMA200 en 1h cambia muy lentamente (una nueva vela cada hora).
 # Descargar 210 velas × 5 símbolos en cada ciclo de 5m es innecesario.
 # Cache con TTL de 30 min: ahorra ~50% de llamadas API en el trading loop.
-_EMA200_CACHE: dict = {}   # {symbol: (ema200_value, timestamp_unix)}
-_EMA200_TTL   = 1800       # 30 minutos
+# ── Cache de EMA50(1h) ────────────────────────────────────────────────────────
+# EMA50 cambia cada ~1h. Cache de 15 min evita llamadas API innecesarias.
+_EMA_CACHE: dict = {}   # {symbol: (ema_value, timestamp_unix, rsi_1h)}
+_EMA_TTL   = 900        # 15 minutos
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ESTADO GLOBAL
@@ -255,25 +260,19 @@ def _macd_histogram_series(closes: list) -> list:
 
 def _macd_confirmed_crossover(closes: list) -> bool:
     """
-    Cruce alcista CONFIRMADO con ventana de 3 velas.
-
-    El cruce exacto (h[-2]<0, h[-1]>=0) se detecta en un solo candle de 5m.
-    Con un scan cada 5 minutos, el bot puede llegar 1-2 velas tarde si el
-    ciclo no coincide exactamente con el momento del cruce.
-    Ampliamos la ventana a 3 velas: si el cruce ocurrió en cualquiera de
-    las últimas 3 velas (15 minutos), la señal sigue siendo válida.
-    Esto triplica las oportunidades de capturar el cruce sin perder precisión
-    (el histograma sigue debiendo haber cruzado de negativo a positivo).
+    Cruce alcista CONFIRMADO con ventana de 5 velas (25 minutos).
+    Ampliado de 3→5 para no perder cruces ocurridos entre scans.
+    El histograma debe mantenerse positivo tras el cruce (confirma que fue real).
     """
     hist = _macd_histogram_series(closes)
-    if len(hist) < 3:
+    if len(hist) < 5:
         return False
-    h0, h1, h2 = hist[-1], hist[-2], hist[-3]
-    # Cruce en las últimas 2 velas (estándar)
+    h0, h1, h2, h3, h4 = hist[-1], hist[-2], hist[-3], hist[-4], hist[-5]
     cross_v1 = h1 < 0.0 and h0 >= 0.0
-    # Cruce en las últimas 3 velas (ventana ampliada)
     cross_v2 = h2 < 0.0 and h1 >= 0.0 and h0 >= 0.0
-    return cross_v1 or cross_v2
+    cross_v3 = h3 < 0.0 and h2 >= 0.0 and h1 >= 0.0 and h0 >= 0.0
+    cross_v4 = h4 < 0.0 and h3 >= 0.0 and h2 >= 0.0 and h1 >= 0.0 and h0 >= 0.0
+    return cross_v1 or cross_v2 or cross_v3 or cross_v4
 
 def _rsi_ascending(closes: list, period: int = 14) -> bool:
     """
@@ -315,35 +314,52 @@ def _volume_filter(ohlcv: list) -> bool:
               cur_vol, avg_vol, cur_vol / avg_vol, "OK" if passes else "NO")
     return passes
 
-def _ema200_above_cached(symbol: str, current_price: float) -> bool:
+def _ema_trend_ok_cached(symbol: str, current_price: float) -> tuple:
     """
-    Versión cacheada de _ema200_above.
-    Descarga las 210 velas de 1h solo si el cache expiró (>30 min).
-    En un ciclo normal de 5 min, usa el valor en memoria sin llamada API.
+    Filtro de tendencia — dos vías de entrada:
+
+    VÍA A: precio > EMA50(1h)  [normal]
+      EMA50 = ~50h de historia. Mucho más reactiva que EMA200 (200h).
+      Permite comprar en recuperaciones dentro de tendencias bajistas.
+
+    VÍA B: RSI(1h) < 25  [override capitulación extrema]
+      Pánico o capitulación de mercado. Estos niveles marcan suelos
+      locales de alta probabilidad — los rebotes más rentables ocurren
+      exactamente cuando el filtro EMA dice 'no compres'.
+      Permite entrar aunque el precio esté bajo EMA50.
+
+    Retorna (ok: bool, motivo: str) para el log de diagnóstico.
     """
-    now = time.time()
-    cached = _EMA200_CACHE.get(symbol)
-    if cached and (now - cached[1]) < _EMA200_TTL:
-        ema200 = cached[0]
-        log.debug("EMA200 cache HIT %s: %.5f (edad %.0fs)", symbol, ema200, now - cached[1])
+    now    = time.time()
+    cached = _EMA_CACHE.get(symbol)
+
+    if cached and (now - cached[1]) < _EMA_TTL:
+        ema_val, _, rsi_1h = cached
+        log.debug("EMA cache HIT %s (edad %.0fs)", symbol, now - cached[1])
     else:
         try:
-            ex    = get_exchange()
-            ohlcv = ex.fetch_ohlcv(symbol, EMA200_TF, limit=EMA200_LIMIT)
-            if len(ohlcv) < 200:
-                return True   # sin datos suficientes, no bloqueamos
-            closes_1h = [float(c[4]) for c in ohlcv]
-            ema200    = _ema(closes_1h, 200)
-            _EMA200_CACHE[symbol] = (ema200, now)
-            log.debug("EMA200 cache MISS %s: calculada %.5f", symbol, ema200)
+            ex       = get_exchange()
+            ohlcv_1h = ex.fetch_ohlcv(symbol, EMA_TF, limit=EMA_LIMIT)
+            if len(ohlcv_1h) < EMA_PERIOD:
+                return True, "sin datos (permitido)"
+            closes_1h = [float(c[4]) for c in ohlcv_1h]
+            ema_val   = _ema(closes_1h, EMA_PERIOD)
+            rsi_1h    = _rsi(closes_1h)
+            _EMA_CACHE[symbol] = (ema_val, now, rsi_1h)
+            log.debug("EMA cache MISS %s: EMA50=%.5f RSI1h=%.1f",
+                      symbol, ema_val, rsi_1h)
         except Exception as e:
-            log.warning("EMA200 fetch error %s: %s — omitiendo filtro", symbol, e)
-            return True
+            log.warning("EMA fetch error %s: %s — permitiendo entrada", symbol, e)
+            return True, "error fetch (permitido)"
 
-    above = current_price > ema200
-    log.debug("EMA200(1h) %s: precio=%.5f ema=%.5f → %s",
-              symbol, current_price, ema200, "SOBRE" if above else "BAJO")
-    return above
+    above_ema = current_price > ema_val
+
+    # VÍA B: override por capitulación extrema en 1h
+    if not above_ema and rsi_1h < 25:
+        return True, f"capitulación RSI(1h)={rsi_1h:.1f}<25"
+
+    motivo = "EMA50✓" if above_ema else "EMA50✗"
+    return above_ema, motivo
 
 # ══════════════════════════════════════════════════════════════════════════════
 # HELPERS DE EXCHANGE
@@ -665,7 +681,7 @@ async def _analyze(symbol: str) -> Optional[dict]:
         closes_5m = [float(c[4]) for c in ohlcv_5m]
         price     = closes_5m[-1]
 
-        ema_ok    = await _async(_ema200_above_cached, symbol, price)
+        ema_ok, ema_motivo = await _async(_ema_trend_ok_cached, symbol, price)
         rsi_val   = _rsi(closes_5m)
         rsi_up    = _rsi_ascending(closes_5m)
         macd_ok   = _macd_confirmed_crossover(closes_5m)
@@ -685,7 +701,7 @@ async def _analyze(symbol: str) -> Optional[dict]:
             "✓" if macd_ok   else "✗",
             "✓" if vol_ok    else "✗",
             "✓" if candle_ok else "✗",
-            "✅ SEÑAL" if signal else "❌ sin señal",
+            f"✅ SEÑAL ({ema_motivo})" if signal else "❌ sin señal",
         )
 
         return {
@@ -921,7 +937,8 @@ async def trading_loop(bot: Bot):
         log.info("BTC Guard activo (%.2f%%)", btc_chg)
         return
 
-    # Escaneo con cuádruple confirmación
+    # Escaneo con señal de 6 condiciones
+    bloques: dict = {"EMA": 0, "RSI": 0, "MACD": 0, "VOL": 0, "VELA": 0}
     for symbol in ALLOWED_SYMBOLS:
         if _slots_available() <= 0:
             break
@@ -936,10 +953,24 @@ async def trading_loop(bot: Bot):
         if not a:
             continue
 
+        # Acumular qué condiciones bloquean más
+        if not a["ema_ok"]:    bloques["EMA"]  += 1
+        if a["rsi"] >= RSI_BUY: bloques["RSI"]  += 1
+        if not a["macd_ok"]:   bloques["MACD"] += 1
+        if not a["vol_ok"]:    bloques["VOL"]  += 1
+        if not a["candle_ok"]: bloques["VELA"] += 1
+
         if a["signal"]:
-            reason = (f"EMA200✓ RSI{a['rsi']:.0f}↑ MACD-X✓ Vol✓ Vela✓")
+            reason = f"EMA50✓ RSI{a['rsi']:.0f}↑ MACD✓ Vol✓ Vela✓"
             await _buy(symbol, bot, reason)
             await asyncio.sleep(1.0)
+
+    # Resumen del ciclo — diagnóstico rápido en Railway
+    if bloques:
+        top_bloqueo = max(bloques, key=bloques.get)
+        log.info("RESUMEN CICLO: bloqueo principal=%s (%d/%d símbolos) | %s",
+                 top_bloqueo, bloques[top_bloqueo], len(ALLOWED_SYMBOLS),
+                 " | ".join(f"{k}={v}" for k, v in bloques.items() if v > 0))
 
     log.info("━━━ FIN — %d/%d posiciones ━━━",
              len(state["positions"]), MAX_POSITIONS)
