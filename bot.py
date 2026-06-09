@@ -685,14 +685,17 @@ async def _analyze(symbol: str) -> Optional[dict]:
         rsi_val   = _rsi(closes_5m)
         rsi_up    = _rsi_ascending(closes_5m)
         macd_ok   = _macd_confirmed_crossover(closes_5m)
+        # Volumen y vela — informativos en el log pero no bloquean la señal.
+        # El volumen en 5m es demasiado ruidoso para ser condición obligatoria.
+        # La vela puede ser roja al momento del scan aunque el rebote sea válido.
         vol_ok    = _volume_filter(ohlcv_5m)
         candle_ok = _bullish_candle(ohlcv_5m)
 
-        signal = (ema_ok and rsi_val < RSI_BUY and rsi_up
-                  and macd_ok and vol_ok and candle_ok)
+        # SEÑAL: 4 condiciones sólidas (EMA50 + RSI<38↑ + MACD cruce)
+        signal = (ema_ok and rsi_val < RSI_BUY and rsi_up and macd_ok)
 
         log.info(
-            "%s | EMA=%s RSI=%.1f(<38=%s,↑=%s) MACD=%s VOL=%s VELA=%s → %s",
+            "%s | EMA=%s RSI=%.1f(<38=%s,↑=%s) MACD=%s [vol=%s vela=%s] → %s",
             symbol,
             "✓" if ema_ok    else "✗",
             rsi_val,
@@ -953,12 +956,11 @@ async def trading_loop(bot: Bot):
         if not a:
             continue
 
-        # Acumular qué condiciones bloquean más
+        # Acumular qué condiciones bloquean (solo las 4 activas)
         if not a["ema_ok"]:    bloques["EMA"]  += 1
         if a["rsi"] >= RSI_BUY: bloques["RSI"]  += 1
         if not a["macd_ok"]:   bloques["MACD"] += 1
-        if not a["vol_ok"]:    bloques["VOL"]  += 1
-        if not a["candle_ok"]: bloques["VELA"] += 1
+        if not a.get("rsi_up"): bloques["RSI↑"] += 1
 
         if a["signal"]:
             reason = f"EMA50✓ RSI{a['rsi']:.0f}↑ MACD✓ Vol✓ Vela✓"
