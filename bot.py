@@ -941,7 +941,7 @@ async def trading_loop(bot: Bot):
         return
 
     # Escaneo con señal de 6 condiciones
-    bloques: dict = {"EMA": 0, "RSI": 0, "MACD": 0, "VOL": 0, "VELA": 0}
+    bloques: dict = {"EMA": 0, "RSI": 0, "RSI_UP": 0, "MACD": 0, "VOL": 0, "VELA": 0}
     for symbol in ALLOWED_SYMBOLS:
         if _slots_available() <= 0:
             break
@@ -957,10 +957,10 @@ async def trading_loop(bot: Bot):
             continue
 
         # Acumular qué condiciones bloquean (solo las 4 activas)
-        if not a["ema_ok"]:    bloques["EMA"]  += 1
-        if a["rsi"] >= RSI_BUY: bloques["RSI"]  += 1
-        if not a["macd_ok"]:   bloques["MACD"] += 1
-        if not a.get("rsi_up"): bloques["RSI↑"] += 1
+        if not a["ema_ok"]:     bloques["EMA"]    += 1
+        if a["rsi"] >= RSI_BUY: bloques["RSI"]    += 1
+        if not a["macd_ok"]:    bloques["MACD"]   += 1
+        if not a.get("rsi_up"): bloques["RSI_UP"] += 1
 
         if a["signal"]:
             reason = f"EMA50✓ RSI{a['rsi']:.0f}↑ MACD✓ Vol✓ Vela✓"
